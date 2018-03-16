@@ -817,10 +817,7 @@ function abstract_eval(@nospecialize(e), vtypes::VarTable, sv::InferenceState)
     else
         t = Any
     end
-    if isa(t, TypeVar)
-        # no need to use a typevar as the type of an expression
-        t = t.ub
-    end
+    @assert !isa(t, TypeVar)
     if isa(t, DataType) && isdefined(t, :instance)
         # replace singleton types with their equivalent Const object
         t = Const(t.instance)
