@@ -3,28 +3,28 @@
 For any newcomer to multi-thread and parallel computing it can be useful to first appreciate 
 the different levels of parallelism offered by Julia. We can divide them in three main categories :
 
-1. Green Threading or Julia Coroutines 
+1. Julia Coroutines (Green Threading)
 2. Multi-Threading
 3. Multi-Core or Distributed Processing
 
-We will consider first Julia  [Tasks (aka Coroutines)](@ref man-tasks) and other high-level interfaces and 
+We will consider first Julia [Tasks (aka Coroutines)](@ref man-tasks) and other high-level interfaces and 
 modules that rely on the Julia runtime library, that allow to suspend and resume computations with full 
-control of inter-`Tasks` coommunication without worrying of the opeartive system's scheduler. Julia also
+control of inter-`Tasks` communication without worrying of the opeartive system's scheduler. Julia also
 allows to communicate between `Tasks` through operations like [`wait`](@ref) and [`fetch`](@ref).
 
-Julia supports also multi-threading , where execution is forked and a anonymous function is run across all
+Julia also supports multi-threading, where execution is forked and an anonymous function is run across all
 threads. Described as a fork-join approach, all threads have to join together and serial execution continues.
 Multi-threading is supported using the `Base.Threads` module that is still considered experimental, as Julia is
 not fully thread-safe, consider for example [this issue](https://github.com/JuliaLang/julia/issues/22581).
-Also multi-threading should be implemented considering properly global variables, locks and atomics, so we will
-present it later.
+Also multi-threading should be implemented only if you take into consideration global variables, locks and 
+atomics, so we will present it later.
 
-In the end, a proper mention will be made on distributed and parallel computing. With scientific computing 
+In the end we will present Julia's way to distributed and parallel computing. With scientific computing 
 in mind, Julia natively implements interfaces to send a process through multiple cores or machines.
 Also we will mention useful external packages for distributed programming like `MPI.jl` and `DistributeArrays.jl`.
 
 
-## Scheduling
+# Coroutines
 
 Julia's parallel programming platform uses [Tasks (aka Coroutines)](@ref man-tasks) to switch among multiple
 computations. Whenever code performs a communication operation like [`fetch`](@ref) or [`wait`](@ref),
@@ -97,7 +97,7 @@ executing external programs, etc. In all these cases, overall execution time can
 other tasks can be run while a file is being read, or while waiting for an external service/program
 to complete.
 
-A channel can be visualized as a pipe, i.e., it has a write end and read end.
+A channel can be visualized as a pipe, i.e., it has a write socket and a read socket :
 
   * Multiple writers in different tasks can write to the same channel concurrently via [`put!`](@ref)
     calls.
@@ -260,8 +260,287 @@ executed sequentially on a single OS thread. Future versions of Julia may suppor
 tasks on multiple threads, in which case compute bound tasks will see benefits of parallel execution
 too.
 
+# Multi-Threading (Experimental)
 
-# Distributed Memory Parallelism
+In addition to tasks, remote calls, and remote references, Julia forwards natively
+supports multi-threading. Note that this section is experimental and the interfaces may change
+in the future.
+
+## Setup
+
+By default, Julia starts up with a single thread of execution. This can be verified by using the
+command [`Threads.nthreads()`](@ref):
+
+```julia-repl
+julia> Threads.nthreads()
+1
+```
+
+The number of threads Julia starts up with is controlled by an environment variable called `JULIA_NUM_THREADS`.
+Now, let's start up Julia with 4 threads:
+
+```bash
+export JULIA_NUM_THREADS=4
+```
+
+(The above command works on bourne shells on Linux and OSX. Note that if you're using a C shell
+on these platforms, you should use the keyword `set` instead of `export`. If you're on Windows,
+start up the command line in the location of `julia.exe` and use `set` instead of `export`.)
+
+Let's verify there are 4 threads at our disposal.
+
+```julia-repl
+julia> Threads.nthreads()
+4
+```
+
+But we are currently on the master thread. To check, we use the function [`Threads.threadid`](@ref)
+
+```julia-repl
+julia> Threads.threadid()
+1
+```
+
+## The `@threads` Macro
+
+Let's work a simple example using our native threads. Let us create an array of zeros:
+
+```jldoctest
+julia> a = zeros(10)
+10-element Array{Float64,1}:
+ 0.0
+ 0.0
+ 0.0
+ 0.0
+ 0.0
+ 0.0
+ 0.0
+ 0.0
+ 0.0
+ 0.0
+```
+
+Let us operate on this array simultaneously using 4 threads. We'll have each thread write its
+thread ID into each location.
+
+Julia supports parallel loops using the [`Threads.@threads`](@ref) macro. This macro is affixed
+in front of a `for` loop to indicate to Julia that the loop is a multi-threaded region:
+
+```julia-repl
+julia> Threads.@threads for i = 1:10
+           a[i] = Threads.threadid()
+       end
+```
+
+The iteration space is split amongst the threads, after which each thread writes its thread ID
+to its assigned locations:
+
+```julia-repl
+julia> a
+10-element Array{Float64,1}:
+ 1.0
+ 1.0
+ 1.0
+ 2.0
+ 2.0
+ 2.0
+ 3.0
+ 3.0
+ 4.0
+ 4.0
+```
+
+Note that [`Threads.@threads`](@ref) does not have an optional reduction parameter like [`@distributed`](@ref).
+
+Julia supports accessing and modifying values *atomically*, that is, in a thread-safe way to avoid
+[race conditions](https://en.wikipedia.org/wiki/Race_condition). A value (which must be of a primitive
+type) can be wrapped as [`Threads.Atomic`](@ref) to indicate it must be accessed in this way.
+Here we can see an example:
+
+```julia-repl
+julia> i = Threads.Atomic{Int}(0);
+
+julia> ids = zeros(4);
+
+julia> old_is = zeros(4);
+
+julia> Threads.@threads for id in 1:4
+           old_is[id] = Threads.atomic_add!(i, id)
+           ids[id] = id
+       end
+
+julia> old_is
+4-element Array{Float64,1}:
+ 0.0
+ 1.0
+ 7.0
+ 3.0
+
+julia> ids
+4-element Array{Float64,1}:
+ 1.0
+ 2.0
+ 3.0
+ 4.0
+```
+
+Had we tried to do the addition without the atomic tag, we might have gotten the
+wrong answer due to a race condition. An example of what would happen if we didn't
+avoid the race:
+
+```julia-repl
+julia> using Base.Threads
+
+julia> nthreads()
+4
+
+julia> acc = Ref(0)
+Base.RefValue{Int64}(0)
+
+julia> @threads for i in 1:1000
+          acc[] += 1
+       end
+
+julia> acc[]
+926
+
+julia> acc = Atomic{Int64}(0)
+Atomic{Int64}(0)
+
+julia> @threads for i in 1:1000
+          atomic_add!(acc, 1)
+       end
+
+julia> acc[]
+1000
+```
+
+!!! note
+    Not *all* primitive types can be wrapped in an `Atomic` tag. Supported types
+    are `Int8`, `Int16`, `Int32`, `Int64`, `Int128`, `UInt8`, `UInt16`, `UInt32`,
+    `UInt64`, `UInt128`, `Float16`, `Float32`, and `Float64`. Additionally,
+    `Int128` and `UInt128` are not supported on AAarch32 and ppc64le.
+
+When using multi-threading we have to be careful when using functions that are not
+[pure](https://en.wikipedia.org/wiki/Pure_function) as we might get a wrong answer.
+For instance functions that have their
+[name ending with `!`](https://docs.julialang.org/en/latest/manual/style-guide/#Append-!-to-names-of-functions-that-modify-their-arguments-1)
+by convention modify their arguments and thus are not pure. However, there are
+functions that have side effects and their name does not end with `!`. For
+instance [`findfirst(regex, str)`](@ref) mutates its `regex` argument or
+[`rand()`](@ref) changes `Base.GLOBAL_RNG` :
+
+```julia-repl
+julia> using Base.Threads
+
+julia> nthreads()
+4
+
+julia> function f()
+           s = repeat(["123", "213", "231"], outer=1000)
+           x = similar(s, Int)
+           rx = r"1"
+           @threads for i in 1:3000
+               x[i] = findfirst(rx, s[i]).start
+           end
+           count(v -> v == 1, x)
+       end
+f (generic function with 1 method)
+
+julia> f() # the correct result is 1000
+1017
+
+julia> function g()
+           a = zeros(1000)
+           @threads for i in 1:1000
+               a[i] = rand()
+           end
+           length(unique(a))
+       end
+g (generic function with 1 method)
+
+julia> srand(1); g() # the result for a single thread is 1000
+781
+```
+
+In such cases one should redesign the code to avoid the possibility of a race condition or use
+[synchronization primitives](https://docs.julialang.org/en/latest/base/multi-threading/#Synchronization-Primitives-1).
+
+For example in order to fix `findfirst` example above one needs to have a
+separate copy of `rx` variable for each thread:
+
+```julia-repl
+julia> function f_fix()
+             s = repeat(["123", "213", "231"], outer=1000)
+             x = similar(s, Int)
+             rx = [Regex("1") for i in 1:nthreads()]
+             @threads for i in 1:3000
+                 x[i] = findfirst(rx[threadid()], s[i]).start
+             end
+             count(v -> v == 1, x)
+         end
+f_fix (generic function with 1 method)
+
+julia> f_fix()
+1000
+```
+
+We now use `Regex("1")` instead of `r"1"` to make sure that Julia
+creates separate instances of `Regex` object for each entry of `rx` vector.
+
+The case of `rand` is a bit more complex as we have to ensure that each thread
+uses non-overlapping pseudorandom number sequences. This can be simply ensured
+by using [`randjump`](@ref) function:
+
+
+```julia-repl
+julia> function g_fix(r)
+           a = zeros(1000)
+           @threads for i in 1:1000
+               a[i] = rand(r[threadid()])
+           end
+           length(unique(a))
+       end
+g_fix (generic function with 1 method)
+
+julia> r = randjump(MersenneTwister(1), big(10)^20, nthreads());
+julia> g_fix(r)
+1000
+```
+
+We pass `r` vector to `g_fix` as generating several RGNs is an expensive
+operation so we do not want to repeat it every time we run the function.
+
+## @threadcall (Experimental)
+
+All I/O tasks, timers, REPL commands, etc are multiplexed onto a single OS thread via an event
+loop. A patched version of libuv ([http://docs.libuv.org/en/v1.x/](http://docs.libuv.org/en/v1.x/))
+provides this functionality. Yield points provide for co-operatively scheduling multiple tasks
+onto the same OS thread. I/O tasks and timers yield implicitly while waiting for the event to
+occur. Calling [`yield`](@ref) explicitly allows for other tasks to be scheduled.
+
+Thus, a task executing a [`ccall`](@ref) effectively prevents the Julia scheduler from executing any other
+tasks till the call returns. This is true for all calls into external libraries. Exceptions are
+calls into custom C code that call back into Julia (which may then yield) or C code that calls
+`jl_yield()` (C equivalent of [`yield`](@ref)).
+
+Note that while Julia code runs on a single thread (by default), libraries used by Julia may launch
+their own internal threads. For example, the BLAS library may start as many threads as there are
+cores on a machine.
+
+The [`@threadcall`](@ref) macro addresses scenarios where we do not want a [`ccall`](@ref) to block the main Julia
+event loop. It schedules a C function for execution in a separate thread. A threadpool with a
+default size of 4 is used for this. The size of the threadpool is controlled via environment variable
+`UV_THREADPOOL_SIZE`. While waiting for a free thread, and during function execution once a thread
+is available, the requesting task (on the main Julia event loop) yields to other tasks. Note that
+`@threadcall` does not return till the execution is complete. From a user point of view, it is
+therefore a blocking call like other Julia APIs.
+
+It is very important that the called function does not call back into Julia.
+
+`@threadcall` may be removed/changed in future versions of Julia.
+
+# Multi-Core or Distributed Processing
 
 An implementation of distributed memory parallel computing is provided by module `Distributed`
 as part of the standard library shipped with Julia.
@@ -531,7 +810,7 @@ and `fetch(Bref)`, it might be better to eliminate the parallelism altogether. O
 is replaced with a more expensive operation. Then it might make sense to add another [`@spawn`](@ref)
 statement just for this step.
 
-# Global variables
+## Global variables
 Expressions executed remotely via `@spawn`, or closures specified for remote execution using
 `remotecall` may refer to global variables. Global bindings under module `Main` are treated
 a little differently compared to global bindings in other modules. Consider the following code
@@ -748,286 +1027,6 @@ A simple example of this is provided in `dictchannel.jl` in the
 [Examples repository](https://github.com/JuliaArchive/Examples), which uses a dictionary as its
 remote store.
 
-## Multi-Threading (Experimental)
-
-In addition to tasks, remote calls, and remote references, Julia from `v0.5` forwards natively
-supports multi-threading. Note that this section is experimental and the interfaces may change
-in the future.
-
-### Setup
-
-By default, Julia starts up with a single thread of execution. This can be verified by using the
-command [`Threads.nthreads()`](@ref):
-
-```julia-repl
-julia> Threads.nthreads()
-1
-```
-
-The number of threads Julia starts up with is controlled by an environment variable called `JULIA_NUM_THREADS`.
-Now, let's start up Julia with 4 threads:
-
-```bash
-export JULIA_NUM_THREADS=4
-```
-
-(The above command works on bourne shells on Linux and OSX. Note that if you're using a C shell
-on these platforms, you should use the keyword `set` instead of `export`. If you're on Windows,
-start up the command line in the location of `julia.exe` and use `set` instead of `export`.)
-
-Let's verify there are 4 threads at our disposal.
-
-```julia-repl
-julia> Threads.nthreads()
-4
-```
-
-But we are currently on the master thread. To check, we use the function [`Threads.threadid`](@ref)
-
-```julia-repl
-julia> Threads.threadid()
-1
-```
-
-### The `@threads` Macro
-
-Let's work a simple example using our native threads. Let us create an array of zeros:
-
-```jldoctest
-julia> a = zeros(10)
-10-element Array{Float64,1}:
- 0.0
- 0.0
- 0.0
- 0.0
- 0.0
- 0.0
- 0.0
- 0.0
- 0.0
- 0.0
-```
-
-Let us operate on this array simultaneously using 4 threads. We'll have each thread write its
-thread ID into each location.
-
-Julia supports parallel loops using the [`Threads.@threads`](@ref) macro. This macro is affixed
-in front of a `for` loop to indicate to Julia that the loop is a multi-threaded region:
-
-```julia-repl
-julia> Threads.@threads for i = 1:10
-           a[i] = Threads.threadid()
-       end
-```
-
-The iteration space is split amongst the threads, after which each thread writes its thread ID
-to its assigned locations:
-
-```julia-repl
-julia> a
-10-element Array{Float64,1}:
- 1.0
- 1.0
- 1.0
- 2.0
- 2.0
- 2.0
- 3.0
- 3.0
- 4.0
- 4.0
-```
-
-Note that [`Threads.@threads`](@ref) does not have an optional reduction parameter like [`@distributed`](@ref).
-
-Julia supports accessing and modifying values *atomically*, that is, in a thread-safe way to avoid
-[race conditions](https://en.wikipedia.org/wiki/Race_condition). A value (which must be of a primitive
-type) can be wrapped as [`Threads.Atomic`](@ref) to indicate it must be accessed in this way.
-Here we can see an example:
-
-```julia-repl
-julia> i = Threads.Atomic{Int}(0);
-
-julia> ids = zeros(4);
-
-julia> old_is = zeros(4);
-
-julia> Threads.@threads for id in 1:4
-           old_is[id] = Threads.atomic_add!(i, id)
-           ids[id] = id
-       end
-
-julia> old_is
-4-element Array{Float64,1}:
- 0.0
- 1.0
- 7.0
- 3.0
-
-julia> ids
-4-element Array{Float64,1}:
- 1.0
- 2.0
- 3.0
- 4.0
-```
-
-Had we tried to do the addition without the atomic tag, we might have gotten the
-wrong answer due to a race condition. An example of what would happen if we didn't
-avoid the race:
-
-```julia-repl
-julia> using Base.Threads
-
-julia> nthreads()
-4
-
-julia> acc = Ref(0)
-Base.RefValue{Int64}(0)
-
-julia> @threads for i in 1:1000
-          acc[] += 1
-       end
-
-julia> acc[]
-926
-
-julia> acc = Atomic{Int64}(0)
-Atomic{Int64}(0)
-
-julia> @threads for i in 1:1000
-          atomic_add!(acc, 1)
-       end
-
-julia> acc[]
-1000
-```
-
-!!! note
-    Not *all* primitive types can be wrapped in an `Atomic` tag. Supported types
-    are `Int8`, `Int16`, `Int32`, `Int64`, `Int128`, `UInt8`, `UInt16`, `UInt32`,
-    `UInt64`, `UInt128`, `Float16`, `Float32`, and `Float64`. Additionally,
-    `Int128` and `UInt128` are not supported on AAarch32 and ppc64le.
-
-When using multi-threading we have to be careful when using functions that are not
-[pure](https://en.wikipedia.org/wiki/Pure_function) as we might get a wrong answer.
-For instance functions that have their
-[name ending with `!`](https://docs.julialang.org/en/latest/manual/style-guide/#Append-!-to-names-of-functions-that-modify-their-arguments-1)
-by convention modify their arguments and thus are not pure. However, there are
-functions that have side effects and their name does not end with `!`. For
-instance [`findfirst(regex, str)`](@ref) mutates its `regex` argument or
-[`rand()`](@ref) changes `Base.GLOBAL_RNG` :
-
-```julia-repl
-julia> using Base.Threads
-
-julia> nthreads()
-4
-
-julia> function f()
-           s = repeat(["123", "213", "231"], outer=1000)
-           x = similar(s, Int)
-           rx = r"1"
-           @threads for i in 1:3000
-               x[i] = findfirst(rx, s[i]).start
-           end
-           count(v -> v == 1, x)
-       end
-f (generic function with 1 method)
-
-julia> f() # the correct result is 1000
-1017
-
-julia> function g()
-           a = zeros(1000)
-           @threads for i in 1:1000
-               a[i] = rand()
-           end
-           length(unique(a))
-       end
-g (generic function with 1 method)
-
-julia> srand(1); g() # the result for a single thread is 1000
-781
-```
-
-In such cases one should redesign the code to avoid the possibility of a race condition or use
-[synchronization primitives](https://docs.julialang.org/en/latest/base/multi-threading/#Synchronization-Primitives-1).
-
-For example in order to fix `findfirst` example above one needs to have a
-separate copy of `rx` variable for each thread:
-
-```julia-repl
-julia> function f_fix()
-             s = repeat(["123", "213", "231"], outer=1000)
-             x = similar(s, Int)
-             rx = [Regex("1") for i in 1:nthreads()]
-             @threads for i in 1:3000
-                 x[i] = findfirst(rx[threadid()], s[i]).start
-             end
-             count(v -> v == 1, x)
-         end
-f_fix (generic function with 1 method)
-
-julia> f_fix()
-1000
-```
-
-We now use `Regex("1")` instead of `r"1"` to make sure that Julia
-creates separate instances of `Regex` object for each entry of `rx` vector.
-
-The case of `rand` is a bit more complex as we have to ensure that each thread
-uses non-overlapping pseudorandom number sequences. This can be simply ensured
-by using [`randjump`](@ref) function:
-
-
-```julia-repl
-julia> function g_fix(r)
-           a = zeros(1000)
-           @threads for i in 1:1000
-               a[i] = rand(r[threadid()])
-           end
-           length(unique(a))
-       end
-g_fix (generic function with 1 method)
-
-julia> r = randjump(MersenneTwister(1), big(10)^20, nthreads());
-julia> g_fix(r)
-1000
-```
-
-We pass `r` vector to `g_fix` as generating several RGNs is an expensive
-operation so we do not want to repeat it every time we run the function.
-
-## @threadcall (Experimental)
-
-All I/O tasks, timers, REPL commands, etc are multiplexed onto a single OS thread via an event
-loop. A patched version of libuv ([http://docs.libuv.org/en/v1.x/](http://docs.libuv.org/en/v1.x/))
-provides this functionality. Yield points provide for co-operatively scheduling multiple tasks
-onto the same OS thread. I/O tasks and timers yield implicitly while waiting for the event to
-occur. Calling [`yield`](@ref) explicitly allows for other tasks to be scheduled.
-
-Thus, a task executing a [`ccall`](@ref) effectively prevents the Julia scheduler from executing any other
-tasks till the call returns. This is true for all calls into external libraries. Exceptions are
-calls into custom C code that call back into Julia (which may then yield) or C code that calls
-`jl_yield()` (C equivalent of [`yield`](@ref)).
-
-Note that while Julia code runs on a single thread (by default), libraries used by Julia may launch
-their own internal threads. For example, the BLAS library may start as many threads as there are
-cores on a machine.
-
-The [`@threadcall`](@ref) macro addresses scenarios where we do not want a [`ccall`](@ref) to block the main Julia
-event loop. It schedules a C function for execution in a separate thread. A threadpool with a
-default size of 4 is used for this. The size of the threadpool is controlled via environment variable
-`UV_THREADPOOL_SIZE`. While waiting for a free thread, and during function execution once a thread
-is available, the requesting task (on the main Julia event loop) yields to other tasks. Note that
-`@threadcall` does not return till the execution is complete. From a user point of view, it is
-therefore a blocking call like other Julia APIs.
-
-It is very important that the called function does not call back into Julia.
-
-`@threadcall` may be removed/changed in future versions of Julia.
-
 
 ## Channels and RemoteChannels
 
@@ -1104,7 +1103,7 @@ julia> @elapsed while n > 0 # print out results
 0.055971741
 ```
 
-## Remote References and Distributed Garbage Collection
+### Remote References and Distributed Garbage Collection
 
 Objects referred to by remote references can be freed only when *all* held references
 in the cluster are deleted.
@@ -1342,7 +1341,7 @@ julia> @time advection_shared!(q,u);
 The biggest advantage of `advection_shared!` is that it minimizes traffic among the workers, allowing
 each to compute for an extended time on the assigned piece.
 
-## Shared Arrays and Distributed Garbage Collection
+### Shared Arrays and Distributed Garbage Collection
 
 Like remote references, shared arrays are also dependent on garbage collection on the creating
 node to release references from all participating workers. Code which creates many short lived
@@ -1513,7 +1512,7 @@ times during the worker's lifetime with appropriate `op` values:
     appropriate worker with an interrupt signal.
   * with `:finalize` for cleanup purposes.
 
-## Cluster Managers with Custom Transports
+### Cluster Managers with Custom Transports
 
 Replacing the default TCP/IP all-to-all socket connections with a custom transport layer is a
 little more involved. Each Julia process has as many communication tasks as the workers it is
@@ -1571,7 +1570,7 @@ The default implementation simply executes an `exit()` call on the specified rem
 The Examples folder `clustermanager/simple` is an example that shows a simple implementation using UNIX domain
 sockets for cluster setup.
 
-## Network Requirements for LocalManager and SSHManager
+### Network Requirements for LocalManager and SSHManager
 
 Julia clusters are designed to be executed on already secured environments on infrastructure such
 as local laptops, departmental clusters, or even the cloud. This section covers network security
@@ -1604,7 +1603,7 @@ requirements for the inbuilt `LocalManager` and `SSHManager`:
     Securing and encrypting all worker-worker traffic (via SSH) or encrypting individual messages
     can be done via a custom `ClusterManager`.
 
-## Cluster Cookie
+### Cluster Cookie
 
 All processes in a cluster share the same cookie which, by default, is a randomly generated string
 on the master process:
@@ -1796,10 +1795,8 @@ MPI.Finalize()
 mpirun -np 4 ./julia example.jl
 ```
 
-
 [^1]:
     in this context, mpi refers to the mpi-1 standard. beginning with mpi-2, the mpi standards committee
     introduced a new set of communication mechanisms, collectively referred to as remote memory access
     (rma). the motivation for adding rma to the mpi standard was to facilitate one-sided communication
     patterns. for additional information on the latest mpi standard, see [http://mpi-forum.org/docs](http://mpi-forum.org/docs/).
-
