@@ -7,22 +7,23 @@ the different levels of parallelism offered by Julia. We can divide them in thre
 2. Multi-Threading
 3. Multi-Core or Distributed Processing
 
-We will consider first Julia [Tasks (aka Coroutines)](@ref man-tasks) and other high-level interfaces and 
-modules that rely on the Julia runtime library, that allow to suspend and resume computations with full 
-control of inter-`Tasks` communication without worrying of the opeartive system's scheduler. Julia also
+We will consider first Julia [Tasks (aka Coroutines)](@ref man-tasks) and other high-level interfaces and
+modules that rely on the Julia runtime library, that allow to suspend and resume computations with full
+control of inter-`Tasks` communication without worrying of the operative system's scheduler. Julia also
 allows to communicate between `Tasks` through operations like [`wait`](@ref) and [`fetch`](@ref).
+Communication and data synchronization is managed through [`Channel`](@ref)s, which are the conduit
+that allows inter-`Tasks` communication.
 
 Julia also supports multi-threading, where execution is forked and an anonymous function is run across all
 threads. Described as a fork-join approach, all threads have to join together and serial execution continues.
 Multi-threading is supported using the `Base.Threads` module that is still considered experimental, as Julia is
 not fully thread-safe, consider for example [this issue](https://github.com/JuliaLang/julia/issues/22581).
-Also multi-threading should be implemented only if you take into consideration global variables, locks and 
+Also multi-threading should be implemented only if you take into consideration global variables, locks and
 atomics, so we will present it later.
 
-In the end we will present Julia's way to distributed and parallel computing. With scientific computing 
+In the end we will present Julia's way to distributed and parallel computing. With scientific computing
 in mind, Julia natively implements interfaces to send a process through multiple cores or machines.
 Also we will mention useful external packages for distributed programming like `MPI.jl` and `DistributeArrays.jl`.
-
 
 # Coroutines
 
@@ -37,43 +38,34 @@ scheduling, a program decides what to compute or where to compute it based on wh
 finish. This is needed for unpredictable or unbalanced workloads, where we want to assign more
 work to processes only when they finish their current tasks.
 
-As an example, consider computing the singular values of matrices of different sizes:
+The [`@spawn`](@ref) macro allows to execute an expression on a remote node, choosen automatically,
+by creating a closure that returns a `Future` as result. 
+To specify the process use [`@spawnat`](@ref)that accepts a process identifier `p` and an expression. 
+You can pass a `Future` value to [wait()](@ref) that will wait until a value becomes available or
+to [fetch()](@ref) that will wait for and return the value of the future.
 
-```julia-repl
-julia> M = Matrix{Float64}[rand(800,800), rand(600,600), rand(800,800), rand(600,600)];
+For example, let's try to discover on which process an expression is located:
+```julia
+julia>addprocs(4)
+4-element Array{Int64,1}:
+[2,3,4,5]
+julia>f = @spawn myid();
 
-julia> pmap(svd, M);
+julia>G = wait(f);
+
+julia>fetch(G)
+2
 ```
 
-If one process handles both 800×800 matrices and another handles both 600×600 matrices, we will
-not get as much scalability as we could. The solution is to make a local task to "feed" work to
-each process when it completes its current task. For example, consider a simple [`pmap`](@ref)
-implementation:
+To check the previous result we can explicit the process
 
 ```julia
-function pmap(f, lst)
-    np = nprocs()  # determine the number of processes available
-    n = length(lst)
-    results = Vector{Any}(n)
-    i = 1
-    # function to produce the next work item from the queue.
-    # in this case it's just an index.
-    nextidx() = (global i; idx=i; i+=1; idx)
-    @sync begin
-        for p=1:np
-            if p != myid() || np == 1
-                @async begin
-                    while true
-                        idx = nextidx()
-                        idx > n && break
-                        results[idx] = remotecall_fetch(f, p, lst[idx])
-                    end
-                end
-            end
-        end
-    end
-    results
-end
+julia>f = @spawnat 3 myid();
+
+julia>G = wait(f);
+
+julia>fetch(G)
+3
 ```
 
 [`@async`](@ref) is similar to [`@spawn`](@ref), but only runs tasks on the local process. We
@@ -81,10 +73,14 @@ use it to create a "feeder" task for each process. Each task picks the next inde
 be computed, then waits for its process to finish, then repeats until we run out of indices. Note
 that the feeder tasks do not begin to execute until the main task reaches the end of the [`@sync`](@ref)
 block, at which point it surrenders control and waits for all the local tasks to complete before
-returning from the function. The feeder tasks are able to share state via `nextidx` because
+returning from the function. As for v0.7 and beyond, the feeder tasks are able to share state via `nextidx` because
 they all run on the same process. No locking is required, since the threads are scheduled cooperatively
 and not preemptively. This means context switches only occur at well-defined points: in this case,
-when [`remotecall_fetch`](@ref) is called.
+when [`remotecall_fetch`](@ref) is called. This is the current state of implementation (dev v0.7) and it may change
+for future Julia versions, as it is intended to make it possible to run up to N `Tasks` on M `Process`, aka
+[M:N Threading](https://en.wikipedia.org/wiki/Thread_(computing)#Models). Then a lock acquiring\releasing 
+model for `nextidx` will be needed, as it is not safe to let multiple processes read-write a resource at
+the same time.
 
 ## Channels
 
@@ -124,18 +120,18 @@ A channel can be visualized as a pipe, i.e., it has a write socket and a read so
         @schedule foo()
     end
     ```
-  * Channels are created via the `Channel{T}(sz)` constructor. The channel will only hold objects
-    of type `T`. If the type is not specified, the channel can hold objects of any type. `sz` refers
-    to the maximum number of elements that can be held in the channel at any time. For example, `Channel(32)`
-    creates a channel that can hold a maximum of 32 objects of any type. A `Channel{MyType}(64)` can
-    hold up to 64 objects of `MyType` at any time.
-  * If a [`Channel`](@ref) is empty, readers (on a [`take!`](@ref) call) will block until data is available.
-  * If a [`Channel`](@ref) is full, writers (on a [`put!`](@ref) call) will block until space becomes available.
-  * [`isready`](@ref) tests for the presence of any object in the channel, while [`wait`](@ref)
-    waits for an object to become available.
-  * A [`Channel`](@ref) is in an open state initially. This means that it can be read from and written to
-    freely via [`take!`](@ref) and [`put!`](@ref) calls. [`close`](@ref) closes a [`Channel`](@ref).
-    On a closed [`Channel`](@ref), [`put!`](@ref) will fail. For example:
+* Channels are created via the `Channel{T}(sz)` constructor. The channel will only hold objects
+  of type `T`. If the type is not specified, the channel can hold objects of any type. `sz` refers
+  to the maximum number of elements that can be held in the channel at any time. For example, `Channel(32)`
+  creates a channel that can hold a maximum of 32 objects of any type. A `Channel{MyType}(64)` can
+  hold up to 64 objects of `MyType` at any time.
+* If a [`Channel`](@ref) is empty, readers (on a [`take!`](@ref) call) will block until data is available.
+* If a [`Channel`](@ref) is full, writers (on a [`put!`](@ref) call) will block until space becomes available.
+* [`isready`](@ref) tests for the presence of any object in the channel, while [`wait`](@ref)
+  waits for an object to become available.
+* A [`Channel`](@ref) is in an open state initially. This means that it can be read from and written to
+  freely via [`take!`](@ref) and [`put!`](@ref) calls. [`close`](@ref) closes a [`Channel`](@ref).
+  On a closed [`Channel`](@ref), [`put!`](@ref) will fail. For example:
 
 ```julia-repl
 julia> c = Channel(2);
@@ -259,6 +255,35 @@ involving I/O operations benefit from parallel execution, compute bound tasks ar
 executed sequentially on a single OS thread. Future versions of Julia may support scheduling of
 tasks on multiple threads, in which case compute bound tasks will see benefits of parallel execution
 too.
+
+## @threadcall (Experimental)
+
+All I/O tasks, timers, REPL commands, etc are multiplexed onto a single OS thread via an event
+loop. A patched version of libuv ([http://docs.libuv.org/en/v1.x/](http://docs.libuv.org/en/v1.x/))
+provides this functionality. Yield points provide for co-operatively scheduling multiple tasks
+onto the same OS thread. I/O tasks and timers yield implicitly while waiting for the event to
+occur. Calling [`yield`](@ref) explicitly allows for other tasks to be scheduled.
+
+Thus, a task executing a [`ccall`](@ref) effectively prevents the Julia scheduler from executing any other
+tasks till the call returns. This is true for all calls into external libraries. Exceptions are
+calls into custom C code that call back into Julia (which may then yield) or C code that calls
+`jl_yield()` (C equivalent of [`yield`](@ref)).
+
+Note that while Julia code runs on a single thread (by default), libraries used by Julia may launch
+their own internal threads. For example, the BLAS library may start as many threads as there are
+cores on a machine.
+
+The [`@threadcall`](@ref) macro addresses scenarios where we do not want a [`ccall`](@ref) to block the main Julia
+event loop. It schedules a C function for execution in a separate thread. A threadpool with a
+default size of 4 is used for this. The size of the threadpool is controlled via environment variable
+`UV_THREADPOOL_SIZE`. While waiting for a free thread, and during function execution once a thread
+is available, the requesting task (on the main Julia event loop) yields to other tasks. Note that
+`@threadcall` does not return till the execution is complete. From a user point of view, it is
+therefore a blocking call like other Julia APIs.
+
+It is very important that the called function does not call back into Julia.
+
+`@threadcall` may be removed/changed in future versions of Julia.
 
 # Multi-Threading (Experimental)
 
@@ -510,35 +535,6 @@ julia> g_fix(r)
 
 We pass `r` vector to `g_fix` as generating several RGNs is an expensive
 operation so we do not want to repeat it every time we run the function.
-
-## @threadcall (Experimental)
-
-All I/O tasks, timers, REPL commands, etc are multiplexed onto a single OS thread via an event
-loop. A patched version of libuv ([http://docs.libuv.org/en/v1.x/](http://docs.libuv.org/en/v1.x/))
-provides this functionality. Yield points provide for co-operatively scheduling multiple tasks
-onto the same OS thread. I/O tasks and timers yield implicitly while waiting for the event to
-occur. Calling [`yield`](@ref) explicitly allows for other tasks to be scheduled.
-
-Thus, a task executing a [`ccall`](@ref) effectively prevents the Julia scheduler from executing any other
-tasks till the call returns. This is true for all calls into external libraries. Exceptions are
-calls into custom C code that call back into Julia (which may then yield) or C code that calls
-`jl_yield()` (C equivalent of [`yield`](@ref)).
-
-Note that while Julia code runs on a single thread (by default), libraries used by Julia may launch
-their own internal threads. For example, the BLAS library may start as many threads as there are
-cores on a machine.
-
-The [`@threadcall`](@ref) macro addresses scenarios where we do not want a [`ccall`](@ref) to block the main Julia
-event loop. It schedules a C function for execution in a separate thread. A threadpool with a
-default size of 4 is used for this. The size of the threadpool is controlled via environment variable
-`UV_THREADPOOL_SIZE`. While waiting for a free thread, and during function execution once a thread
-is available, the requesting task (on the main Julia event loop) yields to other tasks. Note that
-`@threadcall` does not return till the execution is complete. From a user point of view, it is
-therefore a blocking call like other Julia APIs.
-
-It is very important that the called function does not call back into Julia.
-
-`@threadcall` may be removed/changed in future versions of Julia.
 
 # Multi-Core or Distributed Processing
 
@@ -1710,30 +1706,26 @@ true
 julia> typeof(cuC)
 CuArray{Float64,1}
 ```
-Please consider in the last example that since Julia v0.6 some functions won't work like `sin`.
-Use `CUDAnative.sin` instead.
+Keep in mind that some Julia features are not currently supported by CUDAnative.jl [^2] , especially some functions like `sin` will need to be replaced with `CUDAnative.sin`.
 
 In the following example we will use both `DistributedArrays.jl` and `CuArrays.jl` to distribute an array across multiple
 processes and call a generic function on it.
 
 ```julia
-
 function power_method(M, v)
     for i in 1:100
-        v = M*v        
+        v = M*v
         v /= norm(v)
     end
     
     return v, norm(M*v) / norm(v)  # or  (M*v) ./ v
 end
-
 ```
 
-`power_method` repeteavely creates a new vector and normalizes it. We have not specified any type signature in 
-function declaration, let's see if it works with the aforementioned datatypes
+`power_method` repeteavely creates a new vector and normalizes it. We have not specified any type signature in
+function declaration, let's see if it works with the aforementioned datatypes:
 
 ```julia-repl
-
 julia> M = [2. 1; 1 1];
 
 julia> v = rand(2)
@@ -1761,14 +1753,13 @@ julia> dC = power_method(dM, dv);
 
 julia> typeof(dC)
 Tuple{DistributedArrays.DArray{Float64,1,Array{Float64,1}},Float64}
-
 ```
 
 To end this short exposure to external packages, we can consider `MPI.jl`, a Julia wrapper
 of the MPI protocol. As it would take too long to consider every inner functions, it would be better
 to simply appreciate the approach used to implement the protocol.
 
-Consider this toy script which simply calls each subprocess, instantiate its rank and when the master 
+Consider this toy script which simply calls each subprocess, instantiate its rank and when the master
 process is reached, performs the ranks' sum
 
 ```julia
@@ -1800,3 +1791,6 @@ mpirun -np 4 ./julia example.jl
     introduced a new set of communication mechanisms, collectively referred to as remote memory access
     (rma). the motivation for adding rma to the mpi standard was to facilitate one-sided communication
     patterns. for additional information on the latest mpi standard, see [http://mpi-forum.org/docs](http://mpi-forum.org/docs/).
+ 
+ [^2]:
+    [Julia GPU man pages](http://juliagpu.github.io/CUDAnative.jl/stable/man/usage.html#Julia-support-1) cc: @maleadt
