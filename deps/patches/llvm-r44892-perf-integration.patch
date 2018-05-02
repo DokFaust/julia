@@ -1,0 +1,1537 @@
+From c70998c46ae3532482a07d197716ebe46cc46774 Mon Sep 17 00:00:00 2001
+From: DokFaust <rodia@autistici.org>
+Date: Fri, 27 Apr 2018 00:55:22 +0200
+Subject: [PATCH 91/92] Review 44892 for perf integration
+
+---
+ .gitignore                                    |   1 +
+ CMakeLists.txt                                |  13 +
+ D44892.diff                                   | 739 ++++++++++++++++++
+ docs/CMake.rst                                |   3 +
+ include/llvm/Config/config.h.cmake            |   3 +
+ include/llvm/Config/llvm-config.h.cmake       |   3 +
+ .../llvm/ExecutionEngine/JITEventListener.h   |   9 +
+ lib/ExecutionEngine/CMakeLists.txt            |   4 +
+ lib/ExecutionEngine/LLVMBuild.txt             |   2 +-
+ lib/ExecutionEngine/MCJIT/MCJIT.cpp           |  16 +-
+ lib/ExecutionEngine/MCJIT/MCJIT.h             |   2 +
+ lib/ExecutionEngine/Orc/LLVMBuild.txt         |   2 +-
+ .../PerfJITEvents/CMakeLists.txt              |   5 +
+ .../PerfJITEvents/LLVMBuild.txt               |  22 +
+ .../PerfJITEvents/PerfJITEventListener.cpp    | 494 ++++++++++++
+ tools/lli/CMakeLists.txt                      |   9 +
+ tools/lli/lli.cpp                             |   3 +
+ 17 files changed, 1326 insertions(+), 4 deletions(-)
+ create mode 100644 D44892.diff
+ create mode 100644 lib/ExecutionEngine/PerfJITEvents/CMakeLists.txt
+ create mode 100644 lib/ExecutionEngine/PerfJITEvents/LLVMBuild.txt
+ create mode 100644 lib/ExecutionEngine/PerfJITEvents/PerfJITEventListener.cpp
+
+diff --git a/.gitignore b/.gitignore
+index 224bd2f3a9c..b958d221bee 100644
+--- a/.gitignore
++++ b/.gitignore
+@@ -41,6 +41,7 @@ cscope.out
+ autoconf/aclocal.m4
+ autoconf/autom4te.cache
+ /compile_commands.json
++./D44892.diff
+ 
+ #==============================================================================#
+ # Directories to ignore (do not add trailing '/'s, they skip symlinks).
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index 90eb65d5214..f53d17ddd78 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -436,6 +436,16 @@ if( LLVM_USE_OPROFILE )
+   endif( NOT CMAKE_SYSTEM_NAME MATCHES "Linux" )
+ endif( LLVM_USE_OPROFILE )
+ 
++option(LLVM_USE_PERF
++  "Use perf JIT interface to inform perf about JIT code" OFF)
++
++# If enabled, verify we are on a platform that supports perf.
++if( LLVM_USE_PERF )
++  if( NOT CMAKE_SYSTEM_NAME MATCHES "Linux" )
++    message(FATAL_ERROR "perf support is available on Linux only.")
++  endif( NOT CMAKE_SYSTEM_NAME MATCHES "Linux" )
++endif( LLVM_USE_PERF )
++
+ set(LLVM_USE_SANITIZER "" CACHE STRING
+   "Define the sanitizer used to build binaries and tests.")
+ set(LLVM_LIB_FUZZING_ENGINE "" CACHE PATH
+@@ -644,6 +654,9 @@ endif (LLVM_USE_INTEL_JITEVENTS)
+ if (LLVM_USE_OPROFILE)
+   set(LLVMOPTIONALCOMPONENTS ${LLVMOPTIONALCOMPONENTS} OProfileJIT)
+ endif (LLVM_USE_OPROFILE)
++if (LLVM_USE_PERF)
++  set(LLVMOPTIONALCOMPONENTS PerfJITEvents)
++endif (LLVM_USE_PERF)
+ 
+ message(STATUS "Constructing LLVMBuild project information")
+ execute_process(
+diff --git a/D44892.diff b/D44892.diff
+new file mode 100644
+index 00000000000..442b88ef11a
+--- /dev/null
++++ b/D44892.diff
+@@ -0,0 +1,739 @@
++Index: CMakeLists.txt
++===================================================================
++--- CMakeLists.txt
+++++ CMakeLists.txt
++@@ -437,6 +437,16 @@
++   endif( NOT CMAKE_SYSTEM_NAME MATCHES "Linux" )
++ endif( LLVM_USE_OPROFILE )
++ 
+++option(LLVM_USE_PERF
+++  "Use perf JIT interface to inform perf about JIT code" OFF)
+++
+++# If enabled, verify we are on a platform that supports perf.
+++if( LLVM_USE_PERF )
+++  if( NOT CMAKE_SYSTEM_NAME MATCHES "Linux" )
+++    message(FATAL_ERROR "perf support is available on Linux only.")
+++  endif( NOT CMAKE_SYSTEM_NAME MATCHES "Linux" )
+++endif( LLVM_USE_PERF )
+++
++ set(LLVM_USE_SANITIZER "" CACHE STRING
++   "Define the sanitizer used to build binaries and tests.")
++ set(LLVM_LIB_FUZZING_ENGINE "" CACHE PATH
++@@ -645,6 +655,9 @@
++ if (LLVM_USE_OPROFILE)
++   set(LLVMOPTIONALCOMPONENTS ${LLVMOPTIONALCOMPONENTS} OProfileJIT)
++ endif (LLVM_USE_OPROFILE)
+++if (LLVM_USE_PERF)
+++  set(LLVMOPTIONALCOMPONENTS PerfJITEvents)
+++endif (LLVM_USE_PERF)
++ 
++ message(STATUS "Constructing LLVMBuild project information")
++ execute_process(
++Index: docs/CMake.rst
++===================================================================
++--- docs/CMake.rst
+++++ docs/CMake.rst
++@@ -374,6 +374,9 @@
++ **LLVM_USE_INTEL_JITEVENTS**:BOOL
++   Enable building support for Intel JIT Events API. Defaults to OFF.
++ 
+++**LLVM_USE_PERF**:BOOL
+++  Enable building support for Perf (linux profiling tool) JIT support. Defaults to OFF.
+++
++ **LLVM_ENABLE_ZLIB**:BOOL
++   Enable building with zlib to support compression/uncompression in LLVM tools.
++   Defaults to ON.
++Index: include/llvm/Config/config.h.cmake
++===================================================================
++--- include/llvm/Config/config.h.cmake
+++++ include/llvm/Config/config.h.cmake
++@@ -377,6 +377,9 @@
++ /* Define if we have the oprofile JIT-support library */
++ #cmakedefine01 LLVM_USE_OPROFILE
++ 
+++/* Define if we have the perf JIT-support library */
+++#cmakedefine01 LLVM_USE_PERF
+++
++ /* LLVM version information */
++ #cmakedefine LLVM_VERSION_INFO "${LLVM_VERSION_INFO}"
++ 
++Index: include/llvm/Config/llvm-config.h.cmake
++===================================================================
++--- include/llvm/Config/llvm-config.h.cmake
+++++ include/llvm/Config/llvm-config.h.cmake
++@@ -65,6 +65,9 @@
++ /* Define if we have the oprofile JIT-support library */
++ #cmakedefine01 LLVM_USE_OPROFILE
++ 
+++/* Define if we have the perf JIT-support library */
+++#cmakedefine01 LLVM_USE_PERF
+++
++ /* Major version of the LLVM API */
++ #define LLVM_VERSION_MAJOR ${LLVM_VERSION_MAJOR}
++ 
++Index: include/llvm/ExecutionEngine/JITEventListener.h
++===================================================================
++--- include/llvm/ExecutionEngine/JITEventListener.h
+++++ include/llvm/ExecutionEngine/JITEventListener.h
++@@ -115,6 +115,15 @@
++   }
++ #endif // USE_OPROFILE
++ 
+++#if LLVM_USE_PERF
+++  static JITEventListener *createPerfJITEventListener();
+++#else
+++  static JITEventListener *createPerfJITEventListener()
+++  {
+++    return nullptr;
+++  }
+++#endif // USE_PERF
+++
++ private:
++   virtual void anchor();
++ };
++Index: lib/ExecutionEngine/CMakeLists.txt
++===================================================================
++--- lib/ExecutionEngine/CMakeLists.txt
+++++ lib/ExecutionEngine/CMakeLists.txt
++@@ -30,3 +30,7 @@
++ if( LLVM_USE_INTEL_JITEVENTS )
++   add_subdirectory(IntelJITEvents)
++ endif( LLVM_USE_INTEL_JITEVENTS )
+++
+++if( LLVM_USE_PERF )
+++  add_subdirectory(PerfJITEvents)
+++endif( LLVM_USE_PERF )
++Index: lib/ExecutionEngine/LLVMBuild.txt
++===================================================================
++--- lib/ExecutionEngine/LLVMBuild.txt
+++++ lib/ExecutionEngine/LLVMBuild.txt
++@@ -16,7 +16,7 @@
++ ;===------------------------------------------------------------------------===;
++ 
++ [common]
++-subdirectories = Interpreter MCJIT RuntimeDyld IntelJITEvents OProfileJIT Orc
+++subdirectories = Interpreter MCJIT RuntimeDyld IntelJITEvents OProfileJIT Orc PerfJITEvents
++ 
++ [component_0]
++ type = Library
++Index: lib/ExecutionEngine/MCJIT/MCJIT.h
++===================================================================
++--- lib/ExecutionEngine/MCJIT/MCJIT.h
+++++ lib/ExecutionEngine/MCJIT/MCJIT.h
++@@ -189,6 +189,8 @@
++   SmallVector<std::unique_ptr<MemoryBuffer>, 2> Buffers;
++ 
++   SmallVector<std::unique_ptr<object::ObjectFile>, 2> LoadedObjects;
+++  SmallVector<object::ObjectFile*, 2> PendingLoadedObjects;
+++  SmallVector<std::unique_ptr<RuntimeDyld::LoadedObjectInfo>, 2> PendingLoadedObjectInfos;
++ 
++   // An optional ObjectCache to be notified of compiled objects and used to
++   // perform lookup of pre-compiled code to avoid re-compilation.
++Index: lib/ExecutionEngine/MCJIT/MCJIT.cpp
++===================================================================
++--- lib/ExecutionEngine/MCJIT/MCJIT.cpp
+++++ lib/ExecutionEngine/MCJIT/MCJIT.cpp
++@@ -220,8 +220,10 @@
++   if (Dyld.hasError())
++     report_fatal_error(Dyld.getErrorString());
++ 
++-  NotifyObjectEmitted(*LoadedObject.get(), *L);
++-
+++  // Can't call notifiers yet as relocations have not yet been performed, and
+++  // memory hasn't been marked executable.
+++  PendingLoadedObjects.push_back(LoadedObject->get());
+++  PendingLoadedObjectInfos.push_back(std::move(L));
++   Buffers.push_back(std::move(ObjectToLoad));
++   LoadedObjects.push_back(std::move(*LoadedObject));
++ 
++@@ -241,6 +243,16 @@
++ 
++   // Set page permissions.
++   MemMgr->finalizeMemory();
+++
+++  // Notify listeners about loaded objects now that memory is marked executable
+++  // and relocations have been performed.
+++  for (size_t i = 0; i < PendingLoadedObjects.size(); i++) {
+++    auto &Obj = PendingLoadedObjects[i];
+++    auto &Info = PendingLoadedObjectInfos[i];
+++    NotifyObjectEmitted(*Obj, *Info);
+++  }
+++  PendingLoadedObjects.clear();
+++  PendingLoadedObjectInfos.clear();
++ }
++ 
++ // FIXME: Rename this.
++Index: lib/ExecutionEngine/Orc/LLVMBuild.txt
++===================================================================
++--- lib/ExecutionEngine/Orc/LLVMBuild.txt
+++++ lib/ExecutionEngine/Orc/LLVMBuild.txt
++@@ -19,4 +19,4 @@
++ type = Library
++ name = OrcJIT
++ parent = ExecutionEngine
++-required_libraries = Core ExecutionEngine Object RuntimeDyld Support TransformUtils
+++required_libraries = Core ExecutionEngine Object RuntimeDyld Support TransformUtils PerfJITEvents
++Index: lib/ExecutionEngine/PerfJITEvents/CMakeLists.txt
++===================================================================
++--- /dev/null
+++++ lib/ExecutionEngine/PerfJITEvents/CMakeLists.txt
++@@ -0,0 +1,5 @@
+++add_llvm_library(LLVMPerfJITEvents
+++  PerfJITEventListener.cpp
+++  )
+++
+++add_dependencies(LLVMPerfJITEvents LLVMCodeGen)
++Index: lib/ExecutionEngine/PerfJITEvents/LLVMBuild.txt
++===================================================================
++--- lib/ExecutionEngine/PerfJITEvents/LLVMBuild.txt
+++++ lib/ExecutionEngine/PerfJITEvents/LLVMBuild.txt
++@@ -1,4 +1,4 @@
++-;===- ./lib/ExecutionEngine/MCJIT/LLVMBuild.txt ----------------*- Conf -*--===;
+++;===- ./lib/ExecutionEngine/PerfJITEvents/LLVMBuild.txt ----------------*- Conf -*--===;
++ ;
++ ;                     The LLVM Compiler Infrastructure
++ ;
++@@ -16,7 +16,7 @@
++ ;===------------------------------------------------------------------------===;
++ 
++ [component_0]
++-type = Library
++-name = OrcJIT
+++type = OptionalLibrary
+++name = PerfJITEvents
++ parent = ExecutionEngine
++-required_libraries = Core ExecutionEngine Object RuntimeDyld Support TransformUtils
+++required_libraries = CodeGen Core DebugInfoDWARF ExecutionEngine Object Support
++Index: lib/ExecutionEngine/PerfJITEvents/PerfJITEventListener.cpp
++===================================================================
++--- /dev/null
+++++ lib/ExecutionEngine/PerfJITEvents/PerfJITEventListener.cpp
++@@ -0,0 +1,494 @@
+++//===-- PerfJITEventListener.cpp - Tell Linux's perf about JITted code ----===//
+++//
+++//                     The LLVM Compiler Infrastructure
+++//
+++// This file is distributed under the University of Illinois Open Source
+++// License. See LICENSE.TXT for details.
+++//
+++//===----------------------------------------------------------------------===//
+++//
+++// This file defines a JITEventListener object that tells perf about JITted
+++// functions, including source line information.
+++//
+++// Documentation for perf jit integration is available at:
+++// https://git.kernel.org/cgit/linux/kernel/git/torvalds/linux.git/tree/tools/perf/Documentation/jitdump-specification.txt
+++// https://git.kernel.org/cgit/linux/kernel/git/torvalds/linux.git/tree/tools/perf/Documentation/jit-interface.txt
+++//
+++//===----------------------------------------------------------------------===//
+++
+++#include "llvm/ADT/Twine.h"
+++#include "llvm/Config/config.h"
+++#include "llvm/DebugInfo/DWARF/DWARFContext.h"
+++#include "llvm/ExecutionEngine/JITEventListener.h"
+++#include "llvm/Object/ObjectFile.h"
+++#include "llvm/Object/SymbolSize.h"
+++#include "llvm/Support/Debug.h"
+++#include "llvm/Support/Errno.h"
+++#include "llvm/Support/FileSystem.h"
+++#include "llvm/Support/Mutex.h"
+++#include "llvm/Support/MutexGuard.h"
+++#include "llvm/Support/Path.h"
+++#include "llvm/Support/Process.h"
+++#include "llvm/Support/Threading.h"
+++#include "llvm/Support/raw_ostream.h"
+++
+++#include <sys/mman.h>  // mmap()
+++#include <sys/types.h> // getpid()
+++#include <time.h>      // clock_gettime(), time(), localtime_r() */
+++#include <unistd.h>    // for getpid(), read(), close()
+++
+++using namespace llvm;
+++using namespace llvm::object;
+++typedef DILineInfoSpecifier::FileLineInfoKind FileLineInfoKind;
+++
+++namespace {
+++
+++// language identifier (XXX: should we generate something better from debug
+++// info?)
+++#define JIT_LANG "llvm-IR"
+++#define LLVM_PERF_JIT_MAGIC                                                    \
+++  ((uint32_t)'J' << 24 | (uint32_t)'i' << 16 | (uint32_t)'T' << 8 |            \
+++   (uint32_t)'D')
+++#define LLVM_PERF_JIT_VERSION 1
+++
+++// bit 0: set if the jitdump file is using an architecture-specific timestamp
+++// clock source
+++#define JITDUMP_FLAGS_ARCH_TIMESTAMP (1ULL << 0)
+++
+++struct LLVMPerfJitHeader;
+++
+++class PerfJITEventListener : public JITEventListener {
+++public:
+++  PerfJITEventListener();
+++  ~PerfJITEventListener() {
+++    if (MarkerAddr)
+++      CloseMarker();
+++  }
+++
+++  void NotifyObjectEmitted(const ObjectFile &Obj,
+++                           const RuntimeDyld::LoadedObjectInfo &L) override;
+++  void NotifyFreeingObject(const ObjectFile &Obj) override;
+++
+++private:
+++  bool InitDebuggingDir();
+++  bool OpenMarker();
+++  void CloseMarker();
+++  static bool FillMachine(LLVMPerfJitHeader &hdr);
+++
+++  void NotifyCode(Expected<llvm::StringRef> &Symbol, uint64_t CodeAddr,
+++                  uint64_t CodeSize);
+++  void NotifyDebug(uint64_t CodeAddr, DILineInfoTable Lines);
+++
+++  // cache lookups
+++  pid_t Pid;
+++
+++  // base directory for output data
+++  std::string JitPath;
+++
+++  // output data stream, closed via Dumpstream
+++  int DumpFd = -1;
+++
+++  // output data stream
+++  std::unique_ptr<raw_fd_ostream> Dumpstream;
+++
+++  // prevent concurrent dumps from messing up the output file
+++  sys::Mutex Mutex;
+++
+++  // perf mmap marker
+++  void *MarkerAddr = NULL;
+++
+++  // perf support ready
+++  bool SuccessfullyInitialized = false;
+++
+++  // identifier for functions, primarily to identify when moving them around
+++  uint64_t CodeGeneration = 1;
+++};
+++
+++// The following are POD struct definitions from the perf jit specification
+++
+++enum LLVMPerfJitRecordType {
+++  JIT_CODE_LOAD = 0,
+++  JIT_CODE_MOVE = 1, // not emitted, code isn't moved
+++  JIT_CODE_DEBUG_INFO = 2,
+++  JIT_CODE_CLOSE = 3,          // not emitted, unnecessary
+++  JIT_CODE_UNWINDING_INFO = 4, // not emitted
+++
+++  JIT_CODE_MAX
+++};
+++
+++struct LLVMPerfJitHeader {
+++  uint32_t Magic;     // characters "JiTD"
+++  uint32_t Version;   // header version
+++  uint32_t TotalSize; // total size of header
+++  uint32_t ElfMach;   // elf mach target
+++  uint32_t Pad1;      // reserved
+++  uint32_t Pid;
+++  uint64_t Timestamp; // timestamp
+++  uint64_t Flags;     // flags
+++};
+++
+++// record prefix (mandatory in each record)
+++struct LLVMPerfJitRecordPrefix {
+++  uint32_t Id; // record type identifier
+++  uint32_t TotalSize;
+++  uint64_t Timestamp;
+++};
+++
+++struct LLVMPerfJitRecordCodeLoad {
+++  LLVMPerfJitRecordPrefix Prefix;
+++
+++  uint32_t Pid;
+++  uint32_t Tid;
+++  uint64_t Vma;
+++  uint64_t CodeAddr;
+++  uint64_t CodeSize;
+++  uint64_t CodeIndex;
+++};
+++
+++struct LLVMPerfJitDebugEntry {
+++  uint64_t Addr;
+++  int Lineno;  // source line number starting at 1
+++  int Discrim; // column discriminator, 0 is default
+++  // followed by null terminated filename, \xff\0 if same as previous entry
+++};
+++
+++struct LLVMPerfJitRecordDebugInfo {
+++  LLVMPerfJitRecordPrefix Prefix;
+++
+++  uint64_t CodeAddr;
+++  uint64_t NrEntry;
+++  // followed by NrEntry LLVMPerfJitDebugEntry records
+++};
+++
+++static inline uint64_t timespec_to_ns(const struct timespec *ts) {
+++  const uint64_t NanoSecPerSec = 1000000000;
+++  return ((uint64_t)ts->tv_sec * NanoSecPerSec) + ts->tv_nsec;
+++}
+++
+++static inline uint64_t perf_get_timestamp(void) {
+++  struct timespec ts;
+++  int ret;
+++
+++  ret = clock_gettime(CLOCK_MONOTONIC, &ts);
+++  if (ret)
+++    return 0;
+++
+++  return timespec_to_ns(&ts);
+++}
+++
+++PerfJITEventListener::PerfJITEventListener() : Pid(::getpid()) {
+++  // check if clock-source is supported
+++  if (!perf_get_timestamp()) {
+++    errs() << "kernel does not support CLOCK_MONOTONIC\n";
+++    return;
+++  }
+++
+++  if (!InitDebuggingDir()) {
+++    errs() << "could not initialize debugging directory\n";
+++    return;
+++  }
+++
+++  std::string Filename;
+++  raw_string_ostream FilenameBuf(Filename);
+++  FilenameBuf << JitPath << "/jit-" << Pid << ".dump";
+++
+++  // Need to open ourselves, because we need to hand the FD to OpenMarker() and
+++  // raw_fd_ostream doesn't expose the FD.
+++  using sys::fs::openFileForWrite;
+++  if (auto EC =
+++          openFileForWrite(FilenameBuf.str(), DumpFd, sys::fs::F_RW, 0666)) {
+++    errs() << "could not open JIT dump file " << FilenameBuf.str() << ": "
+++           << EC.message() << "\n";
+++    return;
+++  }
+++
+++  Dumpstream = make_unique<raw_fd_ostream>(DumpFd, true);
+++
+++  LLVMPerfJitHeader Header = {0};
+++  if (!FillMachine(Header))
+++    return;
+++
+++  // signal this process emits JIT information
+++  if (!OpenMarker())
+++    return;
+++
+++  // emit dumpstream header
+++  Header.Magic = LLVM_PERF_JIT_MAGIC;
+++  Header.Version = LLVM_PERF_JIT_VERSION;
+++  Header.TotalSize = sizeof(Header);
+++  Header.Pid = Pid;
+++  Header.Timestamp = perf_get_timestamp();
+++  Dumpstream->write(reinterpret_cast<const char *>(&Header), sizeof(Header));
+++
+++  // Everything initialized, can do profiling now.
+++  if (!Dumpstream->has_error())
+++    SuccessfullyInitialized = true;
+++}
+++
+++void PerfJITEventListener::NotifyObjectEmitted(
+++    const ObjectFile &Obj, const RuntimeDyld::LoadedObjectInfo &L) {
+++
+++  if (!SuccessfullyInitialized)
+++    return;
+++
+++  OwningBinary<ObjectFile> DebugObjOwner = L.getObjectForDebug(Obj);
+++  const ObjectFile &DebugObj = *DebugObjOwner.getBinary();
+++
+++  // Get the address of the object image for use as a unique identifier
+++  std::unique_ptr<DIContext> Context = DWARFContext::create(DebugObj);
+++
+++  // Use symbol info to iterate over functions in the object.
+++  for (const std::pair<SymbolRef, uint64_t> &P : computeSymbolSizes(DebugObj)) {
+++    SymbolRef Sym = P.first;
+++    std::string SourceFileName;
+++
+++    Expected<SymbolRef::Type> SymTypeOrErr = Sym.getType();
+++    if (!SymTypeOrErr) {
+++      // There's not much we can with errors here
+++      consumeError(SymTypeOrErr.takeError());
+++      continue;
+++    }
+++    SymbolRef::Type SymType = *SymTypeOrErr;
+++    if (SymType != SymbolRef::ST_Function)
+++      continue;
+++
+++    Expected<StringRef> Name = Sym.getName();
+++    if (!Name) {
+++      consumeError(Name.takeError());
+++      continue;
+++    }
+++
+++    Expected<uint64_t> AddrOrErr = Sym.getAddress();
+++    if (!AddrOrErr) {
+++      consumeError(AddrOrErr.takeError());
+++      continue;
+++    }
+++    uint64_t Addr = *AddrOrErr;
+++    uint64_t Size = P.second;
+++
+++    // According to spec debugging info has to come before loading the
+++    // corresonding code load.
+++    DILineInfoTable Lines = Context->getLineInfoForAddressRange(
+++        Addr, Size, FileLineInfoKind::AbsoluteFilePath);
+++
+++    NotifyDebug(Addr, Lines);
+++    NotifyCode(Name, Addr, Size);
+++  }
+++
+++  Dumpstream->flush();
+++}
+++
+++void PerfJITEventListener::NotifyFreeingObject(const ObjectFile &Obj) {
+++  // perf currently doesn't have an interface for unloading. But munmap()ing the
+++  // code section does, so that's ok.
+++}
+++
+++bool PerfJITEventListener::InitDebuggingDir() {
+++  time_t Time;
+++  struct tm LocalTime;
+++  char TimeBuffer[sizeof("YYYYMMDD")];
+++  SmallString<64> Path;
+++
+++  // search for location to dump data to
+++  if (const char *BaseDir = getenv("JITDUMPDIR"))
+++    Path.append(BaseDir);
+++  else if (!sys::path::home_directory(Path))
+++    Path = ".";
+++
+++  // create debug directory
+++  Path += "/.debug/jit/";
+++  if (auto EC = sys::fs::create_directories(Path)) {
+++    errs() << "could not create jit cache directory " << Path << ": "
+++           << EC.message() << "\n";
+++    return false;
+++  }
+++
+++  // create unique directory for dump data related to this process
+++  time(&Time);
+++  localtime_r(&Time, &LocalTime);
+++  strftime(TimeBuffer, sizeof(TimeBuffer), "%Y%m%d", &LocalTime);
+++  Path += JIT_LANG "-jit-";
+++  Path += TimeBuffer;
+++
+++  SmallString<128> UniqueDebugDir;
+++
+++  using sys::fs::createUniqueDirectory;
+++  if (auto EC = createUniqueDirectory(Path, UniqueDebugDir)) {
+++    errs() << "could not create unique jit cache directory " << UniqueDebugDir
+++           << ": " << EC.message() << "\n";
+++    return false;
+++  }
+++
+++  JitPath = UniqueDebugDir.str();
+++
+++  return true;
+++}
+++
+++bool PerfJITEventListener::OpenMarker() {
+++  // We mmap the jitdump to create an MMAP RECORD in perf.data file.  The mmap
+++  // is captured either live (perf record running when we mmap) or in deferred
+++  // mode, via /proc/PID/maps. The MMAP record is used as a marker of a jitdump
+++  // file for more meta data info about the jitted code. Perf report/annotate
+++  // detect this special filename and process the jitdump file.
+++  //
+++  // Mapping must be PROT_EXEC to ensure it is captured by perf record
+++  // even when not using -d option.
+++  MarkerAddr = ::mmap(NULL, sys::Process::getPageSize(), PROT_READ | PROT_EXEC,
+++                      MAP_PRIVATE, DumpFd, 0);
+++
+++  if (MarkerAddr == MAP_FAILED) {
+++    errs() << "could not mmap JIT marker\n";
+++    return false;
+++  }
+++  return true;
+++}
+++
+++void PerfJITEventListener::CloseMarker() {
+++  if (!MarkerAddr)
+++    return;
+++
+++  munmap(MarkerAddr, sys::Process::getPageSize());
+++  MarkerAddr = nullptr;
+++}
+++
+++bool PerfJITEventListener::FillMachine(LLVMPerfJitHeader &hdr) {
+++  ssize_t sret;
+++  char id[16];
+++  int SelfFD;
+++
+++  struct {
+++    uint16_t e_type;
+++    uint16_t e_machine;
+++  } info;
+++
+++  using sys::fs::openFileForRead;
+++  if (auto EC = openFileForRead("/proc/self/exe", SelfFD)) {
+++    errs() << "could not open /proc/self/exe: " << EC.message() << "\n";
+++    return false;
+++  }
+++
+++  sret = ::read(SelfFD, id, sizeof(id));
+++  if (sret != sizeof(id)) {
+++    errs() << "could not read elf signature from /proc/self/exe\n";
+++    goto error;
+++  }
+++
+++  // check ELF signature
+++  if (id[0] != 0x7f || id[1] != 'E' || id[2] != 'L' || id[3] != 'F') {
+++    errs() << "invalid elf signature\n";
+++    goto error;
+++  }
+++
+++  sret = ::read(SelfFD, &info, sizeof(info));
+++  if (sret != sizeof(info)) {
+++    errs() << "could not read machine identification\n";
+++    goto error;
+++  }
+++
+++  hdr.ElfMach = info.e_machine;
+++  ::close(SelfFD);
+++  return true;
+++
+++error:
+++  ::close(SelfFD);
+++  return false;
+++}
+++
+++void PerfJITEventListener::NotifyCode(Expected<llvm::StringRef> &Symbol,
+++                                      uint64_t CodeAddr, uint64_t CodeSize) {
+++  assert(SuccessfullyInitialized);
+++
+++  // 0 length functions can't have samples.
+++  if (CodeSize == 0)
+++    return;
+++
+++  LLVMPerfJitRecordCodeLoad rec;
+++  rec.Prefix.Id = JIT_CODE_LOAD;
+++  rec.Prefix.TotalSize = sizeof(rec) +        // debug record itself
+++                         Symbol->size() + 1 + // symbol name
+++                         CodeSize;            // and code
+++  rec.Prefix.Timestamp = perf_get_timestamp();
+++
+++  rec.CodeSize = CodeSize;
+++  rec.Vma = 0;
+++  rec.CodeAddr = CodeAddr;
+++  rec.Pid = Pid;
+++  rec.Tid = get_threadid();
+++
+++  // avoid interspersing output
+++  MutexGuard Guard(Mutex);
+++
+++  rec.CodeIndex = CodeGeneration++; // under lock!
+++
+++  Dumpstream->write(reinterpret_cast<const char *>(&rec), sizeof(rec));
+++  Dumpstream->write(Symbol->data(), Symbol->size() + 1);
+++  Dumpstream->write(reinterpret_cast<const char *>(CodeAddr), CodeSize);
+++}
+++
+++void PerfJITEventListener::NotifyDebug(uint64_t CodeAddr,
+++                                       DILineInfoTable Lines) {
+++  assert(SuccessfullyInitialized);
+++
+++  // Didn't get useful debug info.
+++  if (Lines.empty())
+++    return;
+++
+++  LLVMPerfJitRecordDebugInfo rec;
+++  rec.Prefix.Id = JIT_CODE_DEBUG_INFO;
+++  rec.Prefix.TotalSize = sizeof(rec); // will be increased further
+++  rec.Prefix.Timestamp = perf_get_timestamp();
+++  rec.CodeAddr = CodeAddr;
+++  rec.NrEntry = Lines.size();
+++
+++  // compute total size size of record (variable due to filenames)
+++  DILineInfoTable::iterator Begin = Lines.begin();
+++  DILineInfoTable::iterator End = Lines.end();
+++  for (DILineInfoTable::iterator It = Begin; It != End; ++It) {
+++    DILineInfo &line = It->second;
+++    rec.Prefix.TotalSize += sizeof(LLVMPerfJitDebugEntry);
+++    rec.Prefix.TotalSize += line.FileName.size() + 1;
+++  }
+++
+++  // The debug_entry describes the source line information. It is defined as
+++  // follows in order:
+++  // * uint64_t code_addr: address of function for which the debug information
+++  // is generated
+++  // * uint32_t line     : source file line number (starting at 1)
+++  // * uint32_t discrim  : column discriminator, 0 is default
+++  // * char name[n]      : source file name in ASCII, including null termination
+++
+++  // avoid interspersing output
+++  MutexGuard Guard(Mutex);
+++
+++  Dumpstream->write(reinterpret_cast<const char *>(&rec), sizeof(rec));
+++
+++  for (DILineInfoTable::iterator It = Begin; It != End; ++It) {
+++    LLVMPerfJitDebugEntry LineInfo;
+++    DILineInfo &Line = It->second;
+++
+++    LineInfo.Addr = It->first;
+++    // The function re-created by perf is preceded by a elf
+++    // header. Need to adjust for that, otherwise the results are
+++    // wrong.
+++    LineInfo.Addr += 0x40;
+++    LineInfo.Lineno = Line.Line;
+++    LineInfo.Discrim = Line.Discriminator;
+++
+++    Dumpstream->write(reinterpret_cast<const char *>(&LineInfo),
+++                      sizeof(LineInfo));
+++    Dumpstream->write(Line.FileName.c_str(), Line.FileName.size() + 1);
+++  }
+++}
+++
+++// There should be only a single event listener per process, otherwise perf gets
+++// confused.
+++llvm::ManagedStatic<PerfJITEventListener> PerfListener;
+++
+++} // end anonymous namespace
+++
+++namespace llvm {
+++JITEventListener *JITEventListener::createPerfJITEventListener() {
+++  return &*PerfListener;
+++}
+++
+++} // namespace llvm
++Index: tools/lli/CMakeLists.txt
++===================================================================
++--- tools/lli/CMakeLists.txt
+++++ tools/lli/CMakeLists.txt
++@@ -36,6 +36,15 @@
++     )
++ endif( LLVM_USE_INTEL_JITEVENTS )
++ 
+++if( LLVM_USE_PERF )
+++  set(LLVM_LINK_COMPONENTS
+++    ${LLVM_LINK_COMPONENTS}
+++    DebugInfoDWARF
+++    PerfJITEvents
+++    Object
+++    )
+++endif( LLVM_USE_PERF )
+++
++ add_llvm_tool(lli
++   lli.cpp
++   OrcLazyJIT.cpp
++Index: tools/lli/lli.cpp
++===================================================================
++--- tools/lli/lli.cpp
+++++ tools/lli/lli.cpp
++@@ -496,6 +496,9 @@
++                 JITEventListener::createOProfileJITEventListener());
++   EE->RegisterJITEventListener(
++                 JITEventListener::createIntelJITEventListener());
+++  if (!RemoteMCJIT)
+++    EE->RegisterJITEventListener(
+++				 JITEventListener::createPerfJITEventListener());
++ 
++   if (!NoLazyCompilation && RemoteMCJIT) {
++     errs() << "warning: remote mcjit does not support lazy compilation\n";
+diff --git a/docs/CMake.rst b/docs/CMake.rst
+index 7ee1682d51e..0891f4a1c79 100644
+--- a/docs/CMake.rst
++++ b/docs/CMake.rst
+@@ -375,6 +375,9 @@ LLVM-specific variables
+   tools.
+   Defaults to ON.
+ 
++**LLVM_USE_PERF**:BOOL
++  Enable building support for Perf (linux profiling tool) JIT support. Defaults to OFF.
++
+ **LLVM_ENABLE_ZLIB**:BOOL
+   Enable building with zlib to support compression/uncompression in LLVM tools.
+   Defaults to ON.
+diff --git a/include/llvm/Config/config.h.cmake b/include/llvm/Config/config.h.cmake
+index 7c294e014a5..93d118ff09f 100644
+--- a/include/llvm/Config/config.h.cmake
++++ b/include/llvm/Config/config.h.cmake
+@@ -323,6 +323,9 @@
+ /* Define if we have the oprofile JIT-support library */
+ #cmakedefine01 LLVM_USE_OPROFILE
+ 
++/* Define if we have the perf JIT-support library */
++#cmakedefine01 LLVM_USE_PERF
++
+ /* LLVM version information */
+ #cmakedefine LLVM_VERSION_INFO "${LLVM_VERSION_INFO}"
+ 
+diff --git a/include/llvm/Config/llvm-config.h.cmake b/include/llvm/Config/llvm-config.h.cmake
+index 58cc9f99d99..151e713e24c 100644
+--- a/include/llvm/Config/llvm-config.h.cmake
++++ b/include/llvm/Config/llvm-config.h.cmake
+@@ -65,6 +65,9 @@
+ /* Define if we have the oprofile JIT-support library */
+ #cmakedefine01 LLVM_USE_OPROFILE
+ 
++/* Define if we have the perf JIT-support library */
++#cmakedefine01 LLVM_USE_PERF
++
+ /* Major version of the LLVM API */
+ #define LLVM_VERSION_MAJOR ${LLVM_VERSION_MAJOR}
+ 
+diff --git a/include/llvm/ExecutionEngine/JITEventListener.h b/include/llvm/ExecutionEngine/JITEventListener.h
+index ff7840f00a4..ad89599f717 100644
+--- a/include/llvm/ExecutionEngine/JITEventListener.h
++++ b/include/llvm/ExecutionEngine/JITEventListener.h
+@@ -115,6 +115,15 @@ public:
+   }
+ #endif // USE_OPROFILE
+ 
++#if LLVM_USE_PERF
++  static JITEventListener *createPerfJITEventListener();
++#else
++  static JITEventListener *createPerfJITEventListener()
++  {
++    return nullptr;
++  }
++#endif // USE_PERF
++
+ private:
+   virtual void anchor();
+ };
+diff --git a/lib/ExecutionEngine/CMakeLists.txt b/lib/ExecutionEngine/CMakeLists.txt
+index 84b34919e44..c0dea0550fb 100644
+--- a/lib/ExecutionEngine/CMakeLists.txt
++++ b/lib/ExecutionEngine/CMakeLists.txt
+@@ -30,3 +30,7 @@ endif( LLVM_USE_OPROFILE )
+ if( LLVM_USE_INTEL_JITEVENTS )
+   add_subdirectory(IntelJITEvents)
+ endif( LLVM_USE_INTEL_JITEVENTS )
++
++if( LLVM_USE_PERF )
++  add_subdirectory(PerfJITEvents)
++endif( LLVM_USE_PERF )
+diff --git a/lib/ExecutionEngine/LLVMBuild.txt b/lib/ExecutionEngine/LLVMBuild.txt
+index 9d29a41f504..b6e1bda6a51 100644
+--- a/lib/ExecutionEngine/LLVMBuild.txt
++++ b/lib/ExecutionEngine/LLVMBuild.txt
+@@ -16,7 +16,7 @@
+ ;===------------------------------------------------------------------------===;
+ 
+ [common]
+-subdirectories = Interpreter MCJIT RuntimeDyld IntelJITEvents OProfileJIT Orc
++subdirectories = Interpreter MCJIT RuntimeDyld IntelJITEvents OProfileJIT Orc PerfJITEvents
+ 
+ [component_0]
+ type = Library
+diff --git a/lib/ExecutionEngine/MCJIT/MCJIT.cpp b/lib/ExecutionEngine/MCJIT/MCJIT.cpp
+index 82647ea9440..01035f7e4ef 100644
+--- a/lib/ExecutionEngine/MCJIT/MCJIT.cpp
++++ b/lib/ExecutionEngine/MCJIT/MCJIT.cpp
+@@ -220,8 +220,10 @@ void MCJIT::generateCodeForModule(Module *M) {
+   if (Dyld.hasError())
+     report_fatal_error(Dyld.getErrorString());
+ 
+-  NotifyObjectEmitted(*LoadedObject.get(), *L);
+-
++  // Can't call notifiers yet as relocations have not yet been performed, and
++  // memory hasn't been marked executable.
++  PendingLoadedObjects.push_back(LoadedObject->get());
++  PendingLoadedObjectInfos.push_back(std::move(L));
+   Buffers.push_back(std::move(ObjectToLoad));
+   LoadedObjects.push_back(std::move(*LoadedObject));
+ 
+@@ -241,6 +243,16 @@ void MCJIT::finalizeLoadedModules() {
+ 
+   // Set page permissions.
+   MemMgr->finalizeMemory();
++
++  // Notify listeners about loaded objects now that memory is marked executable
++  // and relocations have been performed.
++  for (size_t i = 0; i < PendingLoadedObjects.size(); i++) {
++    auto &Obj = PendingLoadedObjects[i];
++    auto &Info = PendingLoadedObjectInfos[i];
++    NotifyObjectEmitted(*Obj, *Info);
++  }
++  PendingLoadedObjects.clear();
++  PendingLoadedObjectInfos.clear();
+ }
+ 
+ // FIXME: Rename this.
+diff --git a/lib/ExecutionEngine/MCJIT/MCJIT.h b/lib/ExecutionEngine/MCJIT/MCJIT.h
+index 943b14942a0..c1f3016e6c4 100644
+--- a/lib/ExecutionEngine/MCJIT/MCJIT.h
++++ b/lib/ExecutionEngine/MCJIT/MCJIT.h
+@@ -190,6 +190,8 @@ class MCJIT : public ExecutionEngine {
+   SmallVector<std::unique_ptr<MemoryBuffer>, 2> Buffers;
+ 
+   SmallVector<std::unique_ptr<object::ObjectFile>, 2> LoadedObjects;
++  SmallVector<object::ObjectFile*, 2> PendingLoadedObjects;
++  SmallVector<std::unique_ptr<RuntimeDyld::LoadedObjectInfo>, 2> PendingLoadedObjectInfos;
+ 
+   // An optional ObjectCache to be notified of compiled objects and used to
+   // perform lookup of pre-compiled code to avoid re-compilation.
+diff --git a/lib/ExecutionEngine/Orc/LLVMBuild.txt b/lib/ExecutionEngine/Orc/LLVMBuild.txt
+index 8f05172e77a..ef4ae64e823 100644
+--- a/lib/ExecutionEngine/Orc/LLVMBuild.txt
++++ b/lib/ExecutionEngine/Orc/LLVMBuild.txt
+@@ -19,4 +19,4 @@
+ type = Library
+ name = OrcJIT
+ parent = ExecutionEngine
+-required_libraries = Core ExecutionEngine Object RuntimeDyld Support TransformUtils
++required_libraries = Core ExecutionEngine Object RuntimeDyld Support TransformUtils PerfJITEvents
+diff --git a/lib/ExecutionEngine/PerfJITEvents/CMakeLists.txt b/lib/ExecutionEngine/PerfJITEvents/CMakeLists.txt
+new file mode 100644
+index 00000000000..136cc429d02
+--- /dev/null
++++ b/lib/ExecutionEngine/PerfJITEvents/CMakeLists.txt
+@@ -0,0 +1,5 @@
++add_llvm_library(LLVMPerfJITEvents
++  PerfJITEventListener.cpp
++  )
++
++add_dependencies(LLVMPerfJITEvents LLVMCodeGen)
+diff --git a/lib/ExecutionEngine/PerfJITEvents/LLVMBuild.txt b/lib/ExecutionEngine/PerfJITEvents/LLVMBuild.txt
+new file mode 100644
+index 00000000000..bba12c2da00
+--- /dev/null
++++ b/lib/ExecutionEngine/PerfJITEvents/LLVMBuild.txt
+@@ -0,0 +1,22 @@
++;===- ./lib/ExecutionEngine/PerfJITEvents/LLVMBuild.txt ----------------*- Conf -*--===;
++;
++;                     The LLVM Compiler Infrastructure
++;
++; This file is distributed under the University of Illinois Open Source
++; License. See LICENSE.TXT for details.
++;
++;===------------------------------------------------------------------------===;
++;
++; This is an LLVMBuild description file for the components in this subdirectory.
++;
++; For more information on the LLVMBuild system, please see:
++;
++;   http://llvm.org/docs/LLVMBuild.html
++;
++;===------------------------------------------------------------------------===;
++
++[component_0]
++type = OptionalLibrary
++name = PerfJITEvents
++parent = ExecutionEngine
++required_libraries = CodeGen Core DebugInfoDWARF ExecutionEngine Object Support
+diff --git a/lib/ExecutionEngine/PerfJITEvents/PerfJITEventListener.cpp b/lib/ExecutionEngine/PerfJITEvents/PerfJITEventListener.cpp
+new file mode 100644
+index 00000000000..0637dc92ece
+--- /dev/null
++++ b/lib/ExecutionEngine/PerfJITEvents/PerfJITEventListener.cpp
+@@ -0,0 +1,494 @@
++//===-- PerfJITEventListener.cpp - Tell Linux's perf about JITted code ----===//
++//
++//                     The LLVM Compiler Infrastructure
++//
++// This file is distributed under the University of Illinois Open Source
++// License. See LICENSE.TXT for details.
++//
++//===----------------------------------------------------------------------===//
++//
++// This file defines a JITEventListener object that tells perf about JITted
++// functions, including source line information.
++//
++// Documentation for perf jit integration is available at:
++// https://git.kernel.org/cgit/linux/kernel/git/torvalds/linux.git/tree/tools/perf/Documentation/jitdump-specification.txt
++// https://git.kernel.org/cgit/linux/kernel/git/torvalds/linux.git/tree/tools/perf/Documentation/jit-interface.txt
++//
++//===----------------------------------------------------------------------===//
++
++#include "llvm/ADT/Twine.h"
++#include "llvm/Config/config.h"
++#include "llvm/DebugInfo/DWARF/DWARFContext.h"
++#include "llvm/ExecutionEngine/JITEventListener.h"
++#include "llvm/Object/ObjectFile.h"
++#include "llvm/Object/SymbolSize.h"
++#include "llvm/Support/Debug.h"
++#include "llvm/Support/Errno.h"
++#include "llvm/Support/FileSystem.h"
++#include "llvm/Support/Mutex.h"
++#include "llvm/Support/MutexGuard.h"
++#include "llvm/Support/Path.h"
++#include "llvm/Support/Process.h"
++#include "llvm/Support/Threading.h"
++#include "llvm/Support/raw_ostream.h"
++
++#include <sys/mman.h>  // mmap()
++#include <sys/types.h> // getpid()
++#include <time.h>      // clock_gettime(), time(), localtime_r() */
++#include <unistd.h>    // for getpid(), read(), close()
++
++using namespace llvm;
++using namespace llvm::object;
++typedef DILineInfoSpecifier::FileLineInfoKind FileLineInfoKind;
++
++namespace {
++
++// language identifier (XXX: should we generate something better from debug
++// info?)
++#define JIT_LANG "llvm-IR"
++#define LLVM_PERF_JIT_MAGIC                                                    \
++  ((uint32_t)'J' << 24 | (uint32_t)'i' << 16 | (uint32_t)'T' << 8 |            \
++   (uint32_t)'D')
++#define LLVM_PERF_JIT_VERSION 1
++
++// bit 0: set if the jitdump file is using an architecture-specific timestamp
++// clock source
++#define JITDUMP_FLAGS_ARCH_TIMESTAMP (1ULL << 0)
++
++struct LLVMPerfJitHeader;
++
++class PerfJITEventListener : public JITEventListener {
++public:
++  PerfJITEventListener();
++  ~PerfJITEventListener() {
++    if (MarkerAddr)
++      CloseMarker();
++  }
++
++  void NotifyObjectEmitted(const ObjectFile &Obj,
++                           const RuntimeDyld::LoadedObjectInfo &L) override;
++  void NotifyFreeingObject(const ObjectFile &Obj) override;
++
++private:
++  bool InitDebuggingDir();
++  bool OpenMarker();
++  void CloseMarker();
++  static bool FillMachine(LLVMPerfJitHeader &hdr);
++
++  void NotifyCode(Expected<llvm::StringRef> &Symbol, uint64_t CodeAddr,
++                  uint64_t CodeSize);
++  void NotifyDebug(uint64_t CodeAddr, DILineInfoTable Lines);
++
++  // cache lookups
++  pid_t Pid;
++
++  // base directory for output data
++  std::string JitPath;
++
++  // output data stream, closed via Dumpstream
++  int DumpFd = -1;
++
++  // output data stream
++  std::unique_ptr<raw_fd_ostream> Dumpstream;
++
++  // prevent concurrent dumps from messing up the output file
++  sys::Mutex Mutex;
++
++  // perf mmap marker
++  void *MarkerAddr = NULL;
++
++  // perf support ready
++  bool SuccessfullyInitialized = false;
++
++  // identifier for functions, primarily to identify when moving them around
++  uint64_t CodeGeneration = 1;
++};
++
++// The following are POD struct definitions from the perf jit specification
++
++enum LLVMPerfJitRecordType {
++  JIT_CODE_LOAD = 0,
++  JIT_CODE_MOVE = 1, // not emitted, code isn't moved
++  JIT_CODE_DEBUG_INFO = 2,
++  JIT_CODE_CLOSE = 3,          // not emitted, unnecessary
++  JIT_CODE_UNWINDING_INFO = 4, // not emitted
++
++  JIT_CODE_MAX
++};
++
++struct LLVMPerfJitHeader {
++  uint32_t Magic;     // characters "JiTD"
++  uint32_t Version;   // header version
++  uint32_t TotalSize; // total size of header
++  uint32_t ElfMach;   // elf mach target
++  uint32_t Pad1;      // reserved
++  uint32_t Pid;
++  uint64_t Timestamp; // timestamp
++  uint64_t Flags;     // flags
++};
++
++// record prefix (mandatory in each record)
++struct LLVMPerfJitRecordPrefix {
++  uint32_t Id; // record type identifier
++  uint32_t TotalSize;
++  uint64_t Timestamp;
++};
++
++struct LLVMPerfJitRecordCodeLoad {
++  LLVMPerfJitRecordPrefix Prefix;
++
++  uint32_t Pid;
++  uint32_t Tid;
++  uint64_t Vma;
++  uint64_t CodeAddr;
++  uint64_t CodeSize;
++  uint64_t CodeIndex;
++};
++
++struct LLVMPerfJitDebugEntry {
++  uint64_t Addr;
++  int Lineno;  // source line number starting at 1
++  int Discrim; // column discriminator, 0 is default
++  // followed by null terminated filename, \xff\0 if same as previous entry
++};
++
++struct LLVMPerfJitRecordDebugInfo {
++  LLVMPerfJitRecordPrefix Prefix;
++
++  uint64_t CodeAddr;
++  uint64_t NrEntry;
++  // followed by NrEntry LLVMPerfJitDebugEntry records
++};
++
++static inline uint64_t timespec_to_ns(const struct timespec *ts) {
++  const uint64_t NanoSecPerSec = 1000000000;
++  return ((uint64_t)ts->tv_sec * NanoSecPerSec) + ts->tv_nsec;
++}
++
++static inline uint64_t perf_get_timestamp(void) {
++  struct timespec ts;
++  int ret;
++
++  ret = clock_gettime(CLOCK_MONOTONIC, &ts);
++  if (ret)
++    return 0;
++
++  return timespec_to_ns(&ts);
++}
++
++PerfJITEventListener::PerfJITEventListener() : Pid(::getpid()) {
++  // check if clock-source is supported
++  if (!perf_get_timestamp()) {
++    errs() << "kernel does not support CLOCK_MONOTONIC\n";
++    return;
++  }
++
++  if (!InitDebuggingDir()) {
++    errs() << "could not initialize debugging directory\n";
++    return;
++  }
++
++  std::string Filename;
++  raw_string_ostream FilenameBuf(Filename);
++  FilenameBuf << JitPath << "/jit-" << Pid << ".dump";
++
++  // Need to open ourselves, because we need to hand the FD to OpenMarker() and
++  // raw_fd_ostream doesn't expose the FD.
++  using sys::fs::openFileForWrite;
++  if (auto EC =
++          openFileForWrite(FilenameBuf.str(), DumpFd, sys::fs::F_RW, 0666)) {
++    errs() << "could not open JIT dump file " << FilenameBuf.str() << ": "
++           << EC.message() << "\n";
++    return;
++  }
++
++  Dumpstream = make_unique<raw_fd_ostream>(DumpFd, true);
++
++  LLVMPerfJitHeader Header = {0};
++  if (!FillMachine(Header))
++    return;
++
++  // signal this process emits JIT information
++  if (!OpenMarker())
++    return;
++
++  // emit dumpstream header
++  Header.Magic = LLVM_PERF_JIT_MAGIC;
++  Header.Version = LLVM_PERF_JIT_VERSION;
++  Header.TotalSize = sizeof(Header);
++  Header.Pid = Pid;
++  Header.Timestamp = perf_get_timestamp();
++  Dumpstream->write(reinterpret_cast<const char *>(&Header), sizeof(Header));
++
++  // Everything initialized, can do profiling now.
++  if (!Dumpstream->has_error())
++    SuccessfullyInitialized = true;
++}
++
++void PerfJITEventListener::NotifyObjectEmitted(
++    const ObjectFile &Obj, const RuntimeDyld::LoadedObjectInfo &L) {
++
++  if (!SuccessfullyInitialized)
++    return;
++
++  OwningBinary<ObjectFile> DebugObjOwner = L.getObjectForDebug(Obj);
++  const ObjectFile &DebugObj = *DebugObjOwner.getBinary();
++
++  // Get the address of the object image for use as a unique identifier
++  std::unique_ptr<DIContext> Context = DWARFContext::create(DebugObj);
++
++  // Use symbol info to iterate over functions in the object.
++  for (const std::pair<SymbolRef, uint64_t> &P : computeSymbolSizes(DebugObj)) {
++    SymbolRef Sym = P.first;
++    std::string SourceFileName;
++
++    Expected<SymbolRef::Type> SymTypeOrErr = Sym.getType();
++    if (!SymTypeOrErr) {
++      // There's not much we can with errors here
++      consumeError(SymTypeOrErr.takeError());
++      continue;
++    }
++    SymbolRef::Type SymType = *SymTypeOrErr;
++    if (SymType != SymbolRef::ST_Function)
++      continue;
++
++    Expected<StringRef> Name = Sym.getName();
++    if (!Name) {
++      consumeError(Name.takeError());
++      continue;
++    }
++
++    Expected<uint64_t> AddrOrErr = Sym.getAddress();
++    if (!AddrOrErr) {
++      consumeError(AddrOrErr.takeError());
++      continue;
++    }
++    uint64_t Addr = *AddrOrErr;
++    uint64_t Size = P.second;
++
++    // According to spec debugging info has to come before loading the
++    // corresonding code load.
++    DILineInfoTable Lines = Context->getLineInfoForAddressRange(
++        Addr, Size, FileLineInfoKind::AbsoluteFilePath);
++
++    NotifyDebug(Addr, Lines);
++    NotifyCode(Name, Addr, Size);
++  }
++
++  Dumpstream->flush();
++}
++
++void PerfJITEventListener::NotifyFreeingObject(const ObjectFile &Obj) {
++  // perf currently doesn't have an interface for unloading. But munmap()ing the
++  // code section does, so that's ok.
++}
++
++bool PerfJITEventListener::InitDebuggingDir() {
++  time_t Time;
++  struct tm LocalTime;
++  char TimeBuffer[sizeof("YYYYMMDD")];
++  SmallString<64> Path;
++
++  // search for location to dump data to
++  if (const char *BaseDir = getenv("JITDUMPDIR"))
++    Path.append(BaseDir);
++  else if (!sys::path::home_directory(Path))
++    Path = ".";
++
++  // create debug directory
++  Path += "/.debug/jit/";
++  if (auto EC = sys::fs::create_directories(Path)) {
++    errs() << "could not create jit cache directory " << Path << ": "
++           << EC.message() << "\n";
++    return false;
++  }
++
++  // create unique directory for dump data related to this process
++  time(&Time);
++  localtime_r(&Time, &LocalTime);
++  strftime(TimeBuffer, sizeof(TimeBuffer), "%Y%m%d", &LocalTime);
++  Path += JIT_LANG "-jit-";
++  Path += TimeBuffer;
++
++  SmallString<128> UniqueDebugDir;
++
++  using sys::fs::createUniqueDirectory;
++  if (auto EC = createUniqueDirectory(Path, UniqueDebugDir)) {
++    errs() << "could not create unique jit cache directory " << UniqueDebugDir
++           << ": " << EC.message() << "\n";
++    return false;
++  }
++
++  JitPath = UniqueDebugDir.str();
++
++  return true;
++}
++
++bool PerfJITEventListener::OpenMarker() {
++  // We mmap the jitdump to create an MMAP RECORD in perf.data file.  The mmap
++  // is captured either live (perf record running when we mmap) or in deferred
++  // mode, via /proc/PID/maps. The MMAP record is used as a marker of a jitdump
++  // file for more meta data info about the jitted code. Perf report/annotate
++  // detect this special filename and process the jitdump file.
++  //
++  // Mapping must be PROT_EXEC to ensure it is captured by perf record
++  // even when not using -d option.
++  MarkerAddr = ::mmap(NULL, sys::Process::getPageSize(), PROT_READ | PROT_EXEC,
++                      MAP_PRIVATE, DumpFd, 0);
++
++  if (MarkerAddr == MAP_FAILED) {
++    errs() << "could not mmap JIT marker\n";
++    return false;
++  }
++  return true;
++}
++
++void PerfJITEventListener::CloseMarker() {
++  if (!MarkerAddr)
++    return;
++
++  munmap(MarkerAddr, sys::Process::getPageSize());
++  MarkerAddr = nullptr;
++}
++
++bool PerfJITEventListener::FillMachine(LLVMPerfJitHeader &hdr) {
++  ssize_t sret;
++  char id[16];
++  int SelfFD;
++
++  struct {
++    uint16_t e_type;
++    uint16_t e_machine;
++  } info;
++
++  using sys::fs::openFileForRead;
++  if (auto EC = openFileForRead("/proc/self/exe", SelfFD)) {
++    errs() << "could not open /proc/self/exe: " << EC.message() << "\n";
++    return false;
++  }
++
++  sret = ::read(SelfFD, id, sizeof(id));
++  if (sret != sizeof(id)) {
++    errs() << "could not read elf signature from /proc/self/exe\n";
++    goto error;
++  }
++
++  // check ELF signature
++  if (id[0] != 0x7f || id[1] != 'E' || id[2] != 'L' || id[3] != 'F') {
++    errs() << "invalid elf signature\n";
++    goto error;
++  }
++
++  sret = ::read(SelfFD, &info, sizeof(info));
++  if (sret != sizeof(info)) {
++    errs() << "could not read machine identification\n";
++    goto error;
++  }
++
++  hdr.ElfMach = info.e_machine;
++  ::close(SelfFD);
++  return true;
++
++error:
++  ::close(SelfFD);
++  return false;
++}
++
++void PerfJITEventListener::NotifyCode(Expected<llvm::StringRef> &Symbol,
++                                      uint64_t CodeAddr, uint64_t CodeSize) {
++  assert(SuccessfullyInitialized);
++
++  // 0 length functions can't have samples.
++  if (CodeSize == 0)
++    return;
++
++  LLVMPerfJitRecordCodeLoad rec;
++  rec.Prefix.Id = JIT_CODE_LOAD;
++  rec.Prefix.TotalSize = sizeof(rec) +        // debug record itself
++                         Symbol->size() + 1 + // symbol name
++                         CodeSize;            // and code
++  rec.Prefix.Timestamp = perf_get_timestamp();
++
++  rec.CodeSize = CodeSize;
++  rec.Vma = 0;
++  rec.CodeAddr = CodeAddr;
++  rec.Pid = Pid;
++  rec.Tid = get_threadid();
++
++  // avoid interspersing output
++  MutexGuard Guard(Mutex);
++
++  rec.CodeIndex = CodeGeneration++; // under lock!
++
++  Dumpstream->write(reinterpret_cast<const char *>(&rec), sizeof(rec));
++  Dumpstream->write(Symbol->data(), Symbol->size() + 1);
++  Dumpstream->write(reinterpret_cast<const char *>(CodeAddr), CodeSize);
++}
++
++void PerfJITEventListener::NotifyDebug(uint64_t CodeAddr,
++                                       DILineInfoTable Lines) {
++  assert(SuccessfullyInitialized);
++
++  // Didn't get useful debug info.
++  if (Lines.empty())
++    return;
++
++  LLVMPerfJitRecordDebugInfo rec;
++  rec.Prefix.Id = JIT_CODE_DEBUG_INFO;
++  rec.Prefix.TotalSize = sizeof(rec); // will be increased further
++  rec.Prefix.Timestamp = perf_get_timestamp();
++  rec.CodeAddr = CodeAddr;
++  rec.NrEntry = Lines.size();
++
++  // compute total size size of record (variable due to filenames)
++  DILineInfoTable::iterator Begin = Lines.begin();
++  DILineInfoTable::iterator End = Lines.end();
++  for (DILineInfoTable::iterator It = Begin; It != End; ++It) {
++    DILineInfo &line = It->second;
++    rec.Prefix.TotalSize += sizeof(LLVMPerfJitDebugEntry);
++    rec.Prefix.TotalSize += line.FileName.size() + 1;
++  }
++
++  // The debug_entry describes the source line information. It is defined as
++  // follows in order:
++  // * uint64_t code_addr: address of function for which the debug information
++  // is generated
++  // * uint32_t line     : source file line number (starting at 1)
++  // * uint32_t discrim  : column discriminator, 0 is default
++  // * char name[n]      : source file name in ASCII, including null termination
++
++  // avoid interspersing output
++  MutexGuard Guard(Mutex);
++
++  Dumpstream->write(reinterpret_cast<const char *>(&rec), sizeof(rec));
++
++  for (DILineInfoTable::iterator It = Begin; It != End; ++It) {
++    LLVMPerfJitDebugEntry LineInfo;
++    DILineInfo &Line = It->second;
++
++    LineInfo.Addr = It->first;
++    // The function re-created by perf is preceded by a elf
++    // header. Need to adjust for that, otherwise the results are
++    // wrong.
++    LineInfo.Addr += 0x40;
++    LineInfo.Lineno = Line.Line;
++    LineInfo.Discrim = Line.Discriminator;
++
++    Dumpstream->write(reinterpret_cast<const char *>(&LineInfo),
++                      sizeof(LineInfo));
++    Dumpstream->write(Line.FileName.c_str(), Line.FileName.size() + 1);
++  }
++}
++
++// There should be only a single event listener per process, otherwise perf gets
++// confused.
++llvm::ManagedStatic<PerfJITEventListener> PerfListener;
++
++} // end anonymous namespace
++
++namespace llvm {
++JITEventListener *JITEventListener::createPerfJITEventListener() {
++  return &*PerfListener;
++}
++
++} // namespace llvm
+diff --git a/tools/lli/CMakeLists.txt b/tools/lli/CMakeLists.txt
+index f02e19313b7..5f235b6f6f3 100644
+--- a/tools/lli/CMakeLists.txt
++++ b/tools/lli/CMakeLists.txt
+@@ -36,6 +36,15 @@ if( LLVM_USE_INTEL_JITEVENTS )
+     )
+ endif( LLVM_USE_INTEL_JITEVENTS )
+ 
++if( LLVM_USE_PERF )
++  set(LLVM_LINK_COMPONENTS
++    ${LLVM_LINK_COMPONENTS}
++    DebugInfoDWARF
++    PerfJITEvents
++    Object
++    )
++endif( LLVM_USE_PERF )
++
+ add_llvm_tool(lli
+   lli.cpp
+   OrcLazyJIT.cpp
+diff --git a/tools/lli/lli.cpp b/tools/lli/lli.cpp
+index 48aa1d83a48..aafac98b617 100644
+--- a/tools/lli/lli.cpp
++++ b/tools/lli/lli.cpp
+@@ -494,6 +494,9 @@ int main(int argc, char **argv, char * const *envp) {
+                 JITEventListener::createOProfileJITEventListener());
+   EE->RegisterJITEventListener(
+                 JITEventListener::createIntelJITEventListener());
++  if (!RemoteMCJIT)
++    EE->RegisterJITEventListener(
++				 JITEventListener::createPerfJITEventListener());
+ 
+   if (!NoLazyCompilation && RemoteMCJIT) {
+     WithColor::warning(errs(), argv[0])
+-- 
+2.17.0
+
