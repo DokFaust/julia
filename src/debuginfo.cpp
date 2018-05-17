@@ -24,6 +24,9 @@
 #include <llvm/Object/ELFObjectFile.h>
 
 using namespace llvm;
+// TODO this is need to obtain OwningBinary and ObjectFile definition
+// check if no collision emerges
+using namespace llvm::object;
 
 #if JL_LLVM_VERSION >= 50000
 using llvm_file_magic = file_magic;
@@ -423,9 +426,20 @@ public:
         jl_gc_safe_leave(ptls, gc_state);
     }
 
+    std::map<const char*, OwningBinary<ObjectFile>> DebugObjects;
+
+    
     // must implement if we ever start freeing code
     // virtual void NotifyFreeingObject(const ObjectImage &obj) {}
-    // virtual void NotifyFreeingObject(const object::ObjectFile &Obj) {}
+
+    // TODO test this implementation, check if every external module can
+    // override it properly
+    virtual void NotifyFreeingObject(const object::ObjectFile &Obj ) 
+    {
+        // FIXME an event wrapper should be checked to see if the module is
+        // loaded
+       DebugObjects.erase(Obj.getData().data()); 
+    }
 
     std::map<size_t, ObjectInfo, revcomp>& getObjectMap()
     {
@@ -441,6 +455,49 @@ JL_DLLEXPORT void ORCNotifyObjectEmitted(JITEventListener *Listener,
                                          RTDyldMemoryManager *memmgr)
 {
     ((JuliaJITEventListener*)Listener)->_NotifyObjectEmitted(obj,debugObj,L,memmgr);
+}
+
+JL_DLLEXPORT void ORCNotifyFinalized(std::vector<JITEventListener *> EventListeners, 
+                                     const object::ObjectFile &obj,
+                                     const object::ObjectFile &debugObj,
+                                     const RuntimeDyld::LoadedObjectInfo &L,
+                                     RTDyldMemoryManager *memmgr)
+{
+    for(auto &Listener : EventListeners)
+        ((JuliaJITEventListener*)Listener)->_NotifyObjectEmitted(obj,debugObj,L,memmgr);
+    
+}
+
+JL_DLLEXPORT void ORCNotifyFreed(std::vector<JITEventListener *> EventListeners,
+                                 const object::ObjectFile &obj)
+{
+    for(auto &Listener : EventListeners)
+        ((JuliaJITEventListener*)Listener)->NotifyFreeingObject(obj);
+}
+
+// This should be used as an external binding to JuliaJITEventListener
+
+std::vector<JuliaJITEventListener *> JuliaEventListeners;
+
+JL_DLLEXPORT void RegisterJuliaJITEventListener(JITEventListener *L) 
+{
+    if(!L)
+        return;
+    JuliaEventListeners.push_back(((JuliaJITEventListener)L);
+}
+
+JL_DLLEXPORT void UnregisterJuliaJITEventListener(JITEventListener *L)
+{
+    if(!L)
+        return;
+
+
+    auto I = find(reverse(JuliaEventListeners), ((JuliaJITEventListener)L) );
+    if (I != JuliaEventListeners.rend())
+    {
+        std::swap(*I, JuliaJITEventListener.back());
+        JuliaJITEventListener.pop_back();
+    }
 }
 
 static std::pair<char *, bool> jl_demangle(const char *name)
