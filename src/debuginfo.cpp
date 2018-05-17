@@ -483,7 +483,7 @@ JL_DLLEXPORT void RegisterJuliaJITEventListener(JITEventListener *L)
 {
     if(!L)
         return;
-    JuliaEventListeners.push_back(((JuliaJITEventListener)L);
+    JuliaEventListeners.push_back( ((JuliaJITEventListener)L ) );
 }
 
 JL_DLLEXPORT void UnregisterJuliaJITEventListener(JITEventListener *L)
@@ -495,8 +495,8 @@ JL_DLLEXPORT void UnregisterJuliaJITEventListener(JITEventListener *L)
     auto I = find(reverse(JuliaEventListeners), ((JuliaJITEventListener)L) );
     if (I != JuliaEventListeners.rend())
     {
-        std::swap(*I, JuliaJITEventListener.back());
-        JuliaJITEventListener.pop_back();
+        std::swap(*I, JuliaEventListeners.back() );
+        JuliaEventListeners.pop_back();
     }
 }
 
