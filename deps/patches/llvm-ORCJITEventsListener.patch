@@ -1,0 +1,95 @@
+From deac8010ffa7f7dd85ed8fe0827b850cda020baf Mon Sep 17 00:00:00 2001
+From: DokFaust <rodia@autistici.org>
+Date: Sun, 20 May 2018 20:36:43 +0200
+Subject: [PATCH] Added JITEventListenerRef plus Opaqueref
+
+---
+ include/llvm-c/ExecutionEngine.h              |   6 +
+ include/llvm-c/OrcBindings.h                  |  14 +
+ include/llvm-c/Types.h                        |   5 +
+ .../llvm/ExecutionEngine/JITEventListener.h   |   4 +
+ 4 files changed, 29 insertions(+), 0 deletions(-)
+
+diff --git a/include/llvm-c/ExecutionEngine.h b/include/llvm-c/ExecutionEngine.h
+index 51830fe139c..f109a9879ea 100644
+--- a/include/llvm-c/ExecutionEngine.h
++++ b/include/llvm-c/ExecutionEngine.h
+@@ -182,6 +182,12 @@ LLVMMCJITMemoryManagerRef LLVMCreateSimpleMCJITMemoryManager(
+ 
+ void LLVMDisposeMCJITMemoryManager(LLVMMCJITMemoryManagerRef MM);
+ 
++/*===-- JIT Event Listener functions -------------------------------------===*/
++
++LLVMJITEventListenerRef LLVMCreateGDBRegistrationListener(void);
++LLVMJITEventListenerRef LLVMCreateIntelJITEventListener(void);
++LLVMJITEventListenerRef LLVMCreateOprofileJITEventListener(void);
++
+ /**
+  * @}
+  */
+diff --git a/include/llvm-c/OrcBindings.h b/include/llvm-c/OrcBindings.h
+index abb3ac6a7f0..db0876c13a5 100644
+--- a/include/llvm-c/OrcBindings.h
++++ b/include/llvm-c/OrcBindings.h
+@@ -175,6 +175,20 @@ LLVMOrcErrorCode LLVMOrcGetSymbolAddress(LLVMOrcJITStackRef JITStack,
+  */
+ LLVMOrcErrorCode LLVMOrcDisposeInstance(LLVMOrcJITStackRef JITStack);
+ 
++/**
++ * Register a JIT Event Listener.
++ *
++ * A NULL listener is ignored.
++ */
++void LLVMOrcRegisterJITEventListener(LLVMOrcJITStackRef JITStack, LLVMJITEventListenerRef L);
++
++/**
++ * Unegister a JIT Event Listener.
++ *
++ * A NULL listener is ignored.
++ */
++void LLVMOrcUnregisterJITEventListener(LLVMOrcJITStackRef JITStack, LLVMJITEventListenerRef L);
++
+ #ifdef __cplusplus
+ }
+ #endif /* extern "C" */
+diff --git a/include/llvm-c/Types.h b/include/llvm-c/Types.h
+index d63ea4de933..4febe087bc8 100644
+--- a/include/llvm-c/Types.h
++++ b/include/llvm-c/Types.h
+@@ -134,6 +134,11 @@ typedef struct LLVMOpaqueAttributeRef *LLVMAttributeRef;
+  */
+ typedef struct LLVMOpaqueDiagnosticInfo *LLVMDiagnosticInfoRef;
+ 
++/**
++  * @see llvm::JITEventListener
++ */
++typedef struct LLVMOpaqueJITEventListener *LLVMJITEventListenerRef;
++
+ /**
+  * @}
+  */
+diff --git a/include/llvm/ExecutionEngine/JITEventListener.h b/include/llvm/ExecutionEngine/JITEventListener.h
+index ff7840f00a4..bdebf966c9c 100644
+--- a/include/llvm/ExecutionEngine/JITEventListener.h
++++ b/include/llvm/ExecutionEngine/JITEventListener.h
+@@ -15,9 +15,11 @@
+ #ifndef LLVM_EXECUTIONENGINE_JITEVENTLISTENER_H
+ #define LLVM_EXECUTIONENGINE_JITEVENTLISTENER_H
+ 
++#include "llvm-c/ExecutionEngine.h"
+ #include "llvm/Config/llvm-config.h"
+ #include "llvm/ExecutionEngine/RuntimeDyld.h"
+ #include "llvm/IR/DebugLoc.h"
++#include "llvm/Support/CBindingWrapping.h"
+ #include <cstdint>
+ #include <vector>
+ 
+@@ -119,6 +121,8 @@ private:
+   virtual void anchor();
+ };
+ 
++DEFINE_SIMPLE_CONVERSION_FUNCTIONS(JITEventListener, LLVMJITEventListenerRef)
++
+ } // end namespace llvm
+ 
+ #endif // LLVM_EXECUTIONENGINE_JITEVENTLISTENER_H

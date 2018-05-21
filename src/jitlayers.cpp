@@ -679,9 +679,11 @@ Function *JuliaOJIT::FindFunctionNamed(const std::string &Name)
     return shadow_output->getFunction(Name);
 }
 
+JL_DLLEXPORT void RegisterJuliaJITEventListener(JITEventListener *L) 
+
 void JuliaOJIT::RegisterJITEventListener(JITEventListener *L)
 {
-    // TODO
+    RegisterJuliaJITEventListener( L);
 }
 
 const DataLayout& JuliaOJIT::getDataLayout() const
