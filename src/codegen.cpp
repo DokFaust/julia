@@ -119,7 +119,7 @@ legacy::PassManager *jl_globalPM;
 #endif
 
 #ifdef JL_USE_PERF_JITEVENTS
-#include "PerfJITEventsListener.cpp"
+#include "PerfJITEventListener.cpp"
 #endif
 
 extern "C" {
@@ -7681,8 +7681,9 @@ extern "C" void jl_init_codegen(void)
     init_julia_llvm_env(m);
 
 #ifdef JL_USE_PERF_JITEVENTS
-    if(jl_using_perf_jitevents)
-        jl_ExecutionEngine->RegisterJITEventListener(createJuliaPerfJITEventListener());
+    if(jl_using_perf_jitevents) {
+        jl_ExecutionEngine->RegisterJITEventListener(CreatePerfJITEventListener());
+    }
 #endif
 
     BOX_F(int8,int8);  UBOX_F(uint8,uint8);

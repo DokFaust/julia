@@ -457,50 +457,50 @@ JL_DLLEXPORT void ORCNotifyObjectEmitted(JITEventListener *Listener,
     ((JuliaJITEventListener*)Listener)->_NotifyObjectEmitted(obj,debugObj,L,memmgr);
 }
 
-JL_DLLEXPORT void ORCNotifyFinalized(std::vector<JITEventListener *> EventListeners, 
-                                     const object::ObjectFile &obj,
-                                     const object::ObjectFile &debugObj,
-                                     const RuntimeDyld::LoadedObjectInfo &L,
-                                     RTDyldMemoryManager *memmgr)
-{
-    for(auto &Listener : EventListeners)
-        ((JuliaJITEventListener*)Listener)->_NotifyObjectEmitted(obj,debugObj,L,memmgr);
-    
-}
-
-JL_DLLEXPORT void ORCNotifyFreed(std::vector<JITEventListener *> EventListeners,
-                                 const object::ObjectFile &obj)
-{
-    for(auto &Listener : EventListeners)
-        ((JuliaJITEventListener*)Listener)->NotifyFreeingObject(obj);
-}
+// JL_DLLEXPORT void ORCNotifyFinalized(std::vector<JITEventListener *> EventListeners, 
+//                                      const object::ObjectFile &obj,
+//                                      const object::ObjectFile &debugObj,
+//                                      const RuntimeDyld::LoadedObjectInfo &L,
+//                                      RTDyldMemoryManager *memmgr)
+// {
+//     for(auto &Listener : EventListeners)
+//         ((JuliaJITEventListener*)Listener)->_NotifyObjectEmitted(obj,debugObj,L,memmgr);
+//     
+// }
+// 
+// JL_DLLEXPORT void ORCNotifyFreed(std::vector<JITEventListener *> EventListeners,
+//                                  const object::ObjectFile &obj)
+// {
+//     for(auto &Listener : EventListeners)
+//         ((JuliaJITEventListener*)Listener)->NotifyFreeingObject(obj);
+// }
 
 // This should be used as an external binding to JuliaJITEventListener
 
-std::vector<JuliaJITEventListener *> JuliaEventListeners;
-
-JL_DLLEXPORT void RegisterJuliaJITEventListener(JITEventListener *L) 
-{
-    if(!L)
-        return;
-    JuliaEventListeners.push_back( ((JuliaJITEventListener*)L ) );
-}
-
-JL_DLLEXPORT void UnregisterJuliaJITEventListener(JITEventListener *L)
-{
-    if(!L)
-        return;
-
-
-    auto targetL = (JuliaJITEventListener*)L;
-    auto I = find(reverse(JuliaEventListeners), targetL);
-
-    if (I != JuliaEventListeners.rend())
-    {
-        std::swap(*I, JuliaEventListeners.back() );
-        JuliaEventListeners.pop_back();
-    }
-}
+// extern std::vector<JuliaJITEventListener *> JuliaEventListeners;
+// 
+// JL_DLLEXPORT void RegisterJuliaJITEventListener(JITEventListener *L) 
+// {
+//     if(!L)
+//         return;
+//     JuliaEventListeners.push_back( ((JuliaJITEventListener*)L ) );
+// }
+// 
+// JL_DLLEXPORT void UnregisterJuliaJITEventListener(JITEventListener *L)
+// {
+//     if(!L)
+//         return;
+// 
+// 
+//     auto targetL = (JuliaJITEventListener*)L;
+//     auto I = find(reverse(JuliaEventListeners), targetL);
+// 
+//     if (I != JuliaEventListeners.rend())
+//     {
+//         std::swap(*I, JuliaEventListeners.back() );
+//         JuliaEventListeners.pop_back();
+//     }
+// }
 
 static std::pair<char *, bool> jl_demangle(const char *name)
 {

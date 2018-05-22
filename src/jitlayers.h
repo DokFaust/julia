@@ -177,6 +177,7 @@ private:
 };
 extern JuliaOJIT *jl_ExecutionEngine;
 JL_DLLEXPORT extern LLVMContext jl_LLVMContext;
+static std::vector<JITEventListener *> JuliaEventListeners;
 
 Pass *createLowerPTLSPass(bool imaging_mode);
 Pass *createCombineMulAddPass();

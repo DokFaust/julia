@@ -388,6 +388,46 @@ JL_DLLEXPORT void ORCNotifyObjectEmitted(JITEventListener *Listener,
                                          const RuntimeDyld::LoadedObjectInfo &L,
                                          RTDyldMemoryManager *memmgr);
 
+JL_DLLEXPORT void RegisterJuliaJITEventListener(JITEventListener* L);
+
+JL_DLLEXPORT void ORCNotifyFinalized(std::vector<JITEventListener *> EventListeners,                                                                 const object::ObjectFile &obj,
+                                    const RuntimeDyld::LoadedObjectInfo &L)
+{
+    for(auto &Listener : EventListeners)
+        (Listener)->NotifyObjectEmitted(obj,L);
+    
+}
+
+JL_DLLEXPORT void ORCNotifyFreed(std::vector<JITEventListener *> EventListeners,
+                                 const object::ObjectFile &obj)
+{
+    for(auto &Listener : EventListeners)
+        (Listener)->NotifyFreeingObject(obj);
+}
+
+JL_DLLEXPORT void RegisterJuliaJITEventListener(JITEventListener *L) 
+{
+    if(!L)
+        return;
+    JuliaEventListeners.push_back(L);
+}
+
+JL_DLLEXPORT void UnregisterJuliaJITEventListener(JITEventListener *L)
+{
+    if(!L)
+        return;
+
+
+    auto I = find(reverse(JuliaEventListeners), L);
+
+    if (I != JuliaEventListeners.rend())
+    {
+        std::swap(*I, JuliaEventListeners.back() );
+        JuliaEventListeners.pop_back();
+    }
+}
+
+
 template <typename ObjT, typename LoadResult>
 void JuliaOJIT::DebugObjectRegistrar::registerObject(RTDyldObjHandleT H, const ObjT &Object,
                                                      const LoadResult &LO)
@@ -679,11 +719,9 @@ Function *JuliaOJIT::FindFunctionNamed(const std::string &Name)
     return shadow_output->getFunction(Name);
 }
 
-JL_DLLEXPORT void RegisterJuliaJITEventListener(JITEventListener *L) 
-
 void JuliaOJIT::RegisterJITEventListener(JITEventListener *L)
 {
-    RegisterJuliaJITEventListener( L);
+    RegisterJuliaJITEventListener(L);
 }
 
 const DataLayout& JuliaOJIT::getDataLayout() const

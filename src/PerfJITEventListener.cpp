@@ -3,7 +3,6 @@
  */
  
 #include "llvm/ADT/Twine.h"
-#include "llvm/Config/config.h"
 #include "llvm/DebugInfo/DWARF/DWARFContext.h"
 #include "llvm/ExecutionEngine/JITEventListener.h"
 #include "llvm/Object/ObjectFile.h"
@@ -11,12 +10,11 @@
 #include "llvm/Support/Debug.h"
 #include "llvm/Support/Errno.h"
 #include "llvm/Support/FileSystem.h"
-#include "llvm/Support/Mutex.h"
-#include "llvm/Support/MutexGuard.h"
 #include "llvm/Support/Path.h"
 #include "llvm/Support/Process.h"
-#include "llvm/Support/Threading.h"
 #include "llvm/Support/raw_ostream.h"
+
+#include "locks.h"
 
 #include <sys/mman.h>  // mmap()
 #include <sys/types.h> // getpid()
@@ -43,13 +41,13 @@ namespace {
 // clock source
 #define JITDUMP_FLAGS_ARCH_TIMESTAMP (1ULL << 0)
 
-struct LLVMPerfEventHeader;
+struct LLVMPerfJitHeader;
 
-class JuliaPerfJITEventListener : public JuliaJITEventListener {
+class PerfJITEventListener : public JITEventListener {
     
 public:
-    JuliaPerfJITEventListener();
-    ~JuliaPerfJITEventListener()  {
+    PerfJITEventListener();
+    ~PerfJITEventListener()  {
         if(MarkerAddr)
             CloseMarker();
     }
@@ -58,7 +56,7 @@ public:
     void NotifyFreeingObject(const ObjectFile &Obj) override;
 
 private:
-    bool IntDebuggingDir();
+    bool InitDebuggingDir();
     bool OpenMarker();
     void CloseMarker();
     static bool FillMachine(LLVMPerfJitHeader &hdr);
@@ -78,9 +76,6 @@ private:
 
     // output data stream
     std::unique_ptr<raw_fd_ostream> Dumpstream;
-
-    // prevent concurrent dumps from messing up the output file
-    sys::Mutex Mutex;
 
     // perf mmap marker
     void *MarkerAddr = NULL;
@@ -150,7 +145,7 @@ struct LLVMPerfJitRecordDebugInfo {
 
 static inline uint64_t timespec_to_ns(const struct timespec *ts) {
     const uint64_t NanoSecPerSec = 1000000000;
-    return ((uint64_t)ts->tv_sec * NanoSecPerSec)  ts->tv_nsec;
+    return ((uint64_t)ts->tv_sec * NanoSecPerSec) + ts->tv_nsec;
 }
 
 static inline uint64_t perf_get_timestamp(void) {
@@ -164,13 +159,13 @@ static inline uint64_t perf_get_timestamp(void) {
     return timespec_to_ns(&ts);
 }
 
-JuliaPerfJITEventListener::JuliaPerfJITEventListener() : Pid(::getpid()) {
+PerfJITEventListener::PerfJITEventListener() : Pid(::getpid()) {
     if(!perf_get_timestamp()) {
         errs() << "kernel does not support CLOCK_MONOTONIC\n";
         return;
     }
 
-    if(!IntDebuggingDir()) {
+    if(!InitDebuggingDir()) {
         errs() << "could not initialize debugging directory\n";
         return;
     }
@@ -190,7 +185,7 @@ JuliaPerfJITEventListener::JuliaPerfJITEventListener() : Pid(::getpid()) {
     }
 }
 
-JuliaPerfJITEventListener::NotifyObjectEmitted(const ObjectFile &Obj, const RuntimeDyld::LoadedObjectInfo &L) {
+void PerfJITEventListener::NotifyObjectEmitted(const ObjectFile &Obj, const RuntimeDyld::LoadedObjectInfo &L) {
     
     if(!SuccessfullyInitialized)
         return;
@@ -242,45 +237,45 @@ JuliaPerfJITEventListener::NotifyObjectEmitted(const ObjectFile &Obj, const Runt
     Dumpstream->flush();
 }
 
-void JuliaPerfJITEventListener::NotifyFreeingObject(const ObjectFile &Obj) {
+void PerfJITEventListener::NotifyFreeingObject(const ObjectFile &Obj) {
     // TODO Well it seems that perf does not have an interface for object
     // unloading. The LLVM patch seems to achieve this by munmap()ing the
     // code section.
 }
 
-void JuliaPerfJITEventListener::InitDebuggindDir() {
-    time_t time;
-    struct tm LocalTime;
-      SmallString<64> Path;
+bool PerfJITEventListener::InitDebuggingDir() {
+    time_t t = std::time(0);
+    std::tm* now = std::localtime(&t);
+    char TimeBuffer[sizeof("YYYYMMDD")];
+    SmallString<64> Path;
 
     // search for location to dump data to
     if (const char *BaseDir = getenv("JITDUMPDIR"))
-      Path.append(BaseDir);
+        Path.append(BaseDir);
     else if (!sys::path::home_directory(Path))
-      Path = ".";
+        Path = ".";
 
     // create debug directory
-    Path = "/.debug/jit/";
+    Path += "/.debug/jit/";
     if (auto EC = sys::fs::create_directories(Path)) {
-      errs() << "could not create jit cache directory " << Path << ": "
+        errs() << "could not create jit cache directory " << Path << ": "
              << EC.message() << "\n";
-      return false;
+        return false;
     }
 
     // create unique directory for dump data related to this process
-    time(&Time);
-    localtime_r(&Time, &LocalTime);
-    strftime(TimeBuffer, sizeof(TimeBuffer), "%Y%m%d", &LocalTime);
-    Path = JIT_LANG "-jit-";
-    Path = TimeBuffer;
+
+    strftime(TimeBuffer, sizeof(TimeBuffer), "%Y%m%d", now);
+    Path += JIT_LANG "-jit-";
+    Path += TimeBuffer;
 
     SmallString<128> UniqueDebugDir;
 
     using sys::fs::createUniqueDirectory;
     if (auto EC = createUniqueDirectory(Path, UniqueDebugDir)) {
-      errs() << "could not create unique jit cache directory " << UniqueDebugDir
+        errs() << "could not create unique jit cache directory " << UniqueDebugDir
              << ": " << EC.message() << "\n";
-      return false;
+        return false;
     }
 
     JitPath = UniqueDebugDir.str();
@@ -306,7 +301,7 @@ bool PerfJITEventListener::OpenMarker() {
 	return true;
 }
 
-void JuliaPerfJITEventListener::CloseMarker() {
+void PerfJITEventListener::CloseMarker() {
 	if (!MarkerAddr)
 	  return;
 
@@ -314,7 +309,7 @@ void JuliaPerfJITEventListener::CloseMarker() {
 	MarkerAddr = nullptr;
 }
 
-bool JuliaPerfJITEventListener::FillMachine(LLVMPerfJitHeader &hdr) {
+bool PerfJITEventListener::FillMachine(LLVMPerfJitHeader &hdr) {
     ssize_t sret;
     char id[16];
     int SelfFD;
@@ -333,19 +328,20 @@ bool JuliaPerfJITEventListener::FillMachine(LLVMPerfJitHeader &hdr) {
     sret = ::read(SelfFD, id, sizeof(id));
     if (sret != sizeof(id)) {
     	errs() << "could not read elf signature from /proc/self/exe\n";
-    	goto error;
+    	::close(SelfFD);
+        return false;
      }
     
 	// check ELF signature
     if (id[0] != 0x7f || id[1] != 'E' || id[2] != 'L' || id[3] != 'F') {
-		throw std::runtime_error("Elf object signature is not valid\n");
+        errs() << "Elf object signature is not valid\n";
 		::close(SelfFD);
 		return false;
 	}	
 
 	sret = ::read(SelfFD, &info, sizeof(info));
     if (sret != sizeof(info)) {
-		throw std::runtime_error("Could not read machine identification\n");
+		errs() << "Could not read machine identification\n";
 		::close(SelfFD);
 		return false;
     }
@@ -356,9 +352,8 @@ bool JuliaPerfJITEventListener::FillMachine(LLVMPerfJitHeader &hdr) {
 }
 
 
-void JuliaPerfJITEventListener::NotifyCode(Expected<llvm::StringRef> &Symbol,
+void PerfJITEventListener::NotifyCode(Expected<llvm::StringRef> &Symbol,
                                       uint64_t CodeAddr, uint64_t CodeSize) {
-    assert(SuccessfullyInitialized);
 
     // 0 length functions can't have samples.
     if (CodeSize == 0)
@@ -377,9 +372,6 @@ void JuliaPerfJITEventListener::NotifyCode(Expected<llvm::StringRef> &Symbol,
     rec.Pid = Pid;
     rec.Tid = get_threadid();
 
-    // avoid interspersing output
-    MutexGuard Guard(Mutex);
-
     rec.CodeIndex = CodeGeneration++; // under lock!
 
     Dumpstream->write(reinterpret_cast<const char *>(&rec), sizeof(rec));
@@ -388,7 +380,7 @@ void JuliaPerfJITEventListener::NotifyCode(Expected<llvm::StringRef> &Symbol,
 
 }
 
-void JuliaPerfJITEventListener::NotifyDebug(uint64_t CodeAddr,
+void PerfJITEventListener::NotifyDebug(uint64_t CodeAddr,
 									 DILineInfoTable Lines) {
 	assert(SuccessfullyInitialized);
 
@@ -420,8 +412,6 @@ void JuliaPerfJITEventListener::NotifyDebug(uint64_t CodeAddr,
 	// * uint32_t discrim  : column discriminator, 0 is default
 	// * char name[n]      : source file name in ASCII, including null termination
 
-	// avoid interspersing output
-	MutexGuard Guard(Mutex);
 
 	Dumpstream->write(reinterpret_cast<const char *>(&rec), sizeof(rec));
 
@@ -443,17 +433,18 @@ void JuliaPerfJITEventListener::NotifyDebug(uint64_t CodeAddr,
 	}
 }
 
-llvm::ManagedStatic<JuliaPerfJITEventListener> JuliaEventListener;
+// llvm::ManagedStatic<PerfJITEventListener> PerfEventListener;
+
+// JITEventListener PerfJITEventListener::createPerfJITEventListener() {
+//     return &*PerfEventListener;
+// }
+
+JITEventListener *CreatePerfJITEventListener() {
+    return new PerfJITEventListener();
+}
 
 } // end anonymous namespace
 
-namespace llvm {
-	JITEventListener JITEventListener::createJuliaPerfJITEventListener() {
-	return &*JuliaEventListener;
-}
-
-LLVMJITEventListenerRef LLVMCreateJuliaPerfJITEventListener(void) {
-    return wrap(JITEventListener::createJuliaPerfJITEventListener());
-}
-
-} //End llvm namespace
+// LLVMJITEventListenerRef LLVMCreatePerfJITEventListener(void) {
+//     return wrap(JITEventListener::createPerfJITEventListener());
+// }
