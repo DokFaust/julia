@@ -7,28 +7,29 @@ the different levels of parallelism offered by Julia. We can divide them in thre
 2. Multi-Threading
 3. Multi-Core or Distributed Processing
 
-We will consider first Julia [Tasks (aka Coroutines)](@ref man-tasks) and other high-level interfaces and
-modules that rely on the Julia runtime library, that allow to suspend and resume computations with full
-control of inter-`Tasks` communication without worrying of the operative system's scheduler. Julia also
-allows to communicate between `Tasks` through operations like [`wait`](@ref) and [`fetch`](@ref).
+We will consider first Julia [Tasks (aka Coroutines)](@ref man-tasks) and other modules that rely on the Julia runtime library, that allow to suspend and resume computations with full control of inter-`Tasks` communication without having to manually interface with the operative system's scheduler.
+Julia also allows to communicate between `Tasks` through operations like [`wait`](@ref) and [`fetch`](@ref).
 Communication and data synchronization is managed through [`Channel`](@ref)s, which are the conduit
 that allows inter-`Tasks` communication.
 
-Julia also supports multi-threading, where execution is forked and an anonymous function is run across all
-threads. Described as a fork-join approach, all threads have to join together and serial execution continues.
+Julia also supports experimental multi-threading, where execution is forked and an anonymous function is run across all
+threads. 
+Described as a fork-join approach, parallel threads are branched off and they all have to join to the Julia main thread to make serial execution continue.
 Multi-threading is supported using the `Base.Threads` module that is still considered experimental, as Julia is
-not fully thread-safe, consider for example [this issue](https://github.com/JuliaLang/julia/issues/22581).
-Also multi-threading should be implemented only if you take into consideration global variables, locks and
+not fully thread-safe, in particular segfaults seem to emerge for I\O operations and task switching. 
+As an un updated reference, keep an eye on [the issue tracker.](https://github.com/JuliaLang/julia/issues?q=is%3Aopen+is%3Aissue+label%3Amultithreading).
+Also multi-threading should only be used if you take into consideration global variables, locks and
 atomics, so we will present it later.
 
 In the end we will present Julia's way to distributed and parallel computing. With scientific computing
-in mind, Julia natively implements interfaces to send a process through multiple cores or machines.
-Also we will mention useful external packages for distributed programming like `MPI.jl` and `DistributeArrays.jl`.
+in mind, Julia natively implements interfaces to distribute a process through multiple cores or machines.
+Also we will mention useful external packages for distributed programming like `MPI.jl` and `DistributedArrays.jl`.
 
 # Coroutines
 
 Julia's parallel programming platform uses [Tasks (aka Coroutines)](@ref man-tasks) to switch among multiple
-computations. Whenever code performs a communication operation like [`fetch`](@ref) or [`wait`](@ref),
+computations. To express an order of execution between lightweight threads communication primitives are necessary.  Julia offers `Channel(func::Function, ctype=Any, csize=0, taskref=nothing)` that creates a new task from `func`,bind it to a new channel of type `ctype` and size`csize` and schedule the task. Also `Channels` can serve as a way to communicate between tasks, as `Channel{T}(sz::Int)` creates a buffered channel of type `T` and size `sz`.
+Whenever code performs a communication operation like [`fetch`](@ref) or [`wait`](@ref),
 the current task is suspended and a scheduler picks another task to run. A task is restarted when
 the event it is waiting for completes.
 
@@ -37,50 +38,6 @@ to wait for multiple events at the same time, which provides for *dynamic schedu
 scheduling, a program decides what to compute or where to compute it based on when other jobs
 finish. This is needed for unpredictable or unbalanced workloads, where we want to assign more
 work to processes only when they finish their current tasks.
-
-The [`@spawn`](@ref) macro allows to execute an expression on a remote node, choosen automatically,
-by creating a closure that returns a `Future` as result. 
-To specify the process use [`@spawnat`](@ref)that accepts a process identifier `p` and an expression. 
-You can pass a `Future` value to [wait()](@ref) that will wait until a value becomes available or
-to [fetch()](@ref) that will wait for and return the value of the future.
-
-For example, let's try to discover on which process an expression is located:
-```julia
-julia>addprocs(4)
-4-element Array{Int64,1}:
-[2,3,4,5]
-julia>f = @spawn myid();
-
-julia>G = wait(f);
-
-julia>fetch(G)
-2
-```
-
-To check the previous result we can explicit the process
-
-```julia
-julia>f = @spawnat 3 myid();
-
-julia>G = wait(f);
-
-julia>fetch(G)
-3
-```
-
-[`@async`](@ref) is similar to [`@spawn`](@ref), but only runs tasks on the local process. We
-use it to create a "feeder" task for each process. Each task picks the next index that needs to
-be computed, then waits for its process to finish, then repeats until we run out of indices. Note
-that the feeder tasks do not begin to execute until the main task reaches the end of the [`@sync`](@ref)
-block, at which point it surrenders control and waits for all the local tasks to complete before
-returning from the function. As for v0.7 and beyond, the feeder tasks are able to share state via `nextidx` because
-they all run on the same process. No locking is required, since the threads are scheduled cooperatively
-and not preemptively. This means context switches only occur at well-defined points: in this case,
-when [`remotecall_fetch`](@ref) is called. This is the current state of implementation (dev v0.7) and it may change
-for future Julia versions, as it is intended to make it possible to run up to N `Tasks` on M `Process`, aka
-[M:N Threading](https://en.wikipedia.org/wiki/Thread_(computing)#Models). Then a lock acquiring\releasing 
-model for `nextidx` will be needed, as it is not safe to let multiple processes read-write a resource at
-the same time.
 
 ## Channels
 
@@ -93,7 +50,7 @@ executing external programs, etc. In all these cases, overall execution time can
 other tasks can be run while a file is being read, or while waiting for an external service/program
 to complete.
 
-A channel can be visualized as a pipe, i.e., it has a write socket and a read socket :
+A channel can be visualized as a pipe, i.e., it has a write end and a read end :
 
   * Multiple writers in different tasks can write to the same channel concurrently via [`put!`](@ref)
     calls.
@@ -256,40 +213,10 @@ executed sequentially on a single OS thread. Future versions of Julia may suppor
 tasks on multiple threads, in which case compute bound tasks will see benefits of parallel execution
 too.
 
-## @threadcall (Experimental)
-
-All I/O tasks, timers, REPL commands, etc are multiplexed onto a single OS thread via an event
-loop. A patched version of libuv ([http://docs.libuv.org/en/v1.x/](http://docs.libuv.org/en/v1.x/))
-provides this functionality. Yield points provide for co-operatively scheduling multiple tasks
-onto the same OS thread. I/O tasks and timers yield implicitly while waiting for the event to
-occur. Calling [`yield`](@ref) explicitly allows for other tasks to be scheduled.
-
-Thus, a task executing a [`ccall`](@ref) effectively prevents the Julia scheduler from executing any other
-tasks till the call returns. This is true for all calls into external libraries. Exceptions are
-calls into custom C code that call back into Julia (which may then yield) or C code that calls
-`jl_yield()` (C equivalent of [`yield`](@ref)).
-
-Note that while Julia code runs on a single thread (by default), libraries used by Julia may launch
-their own internal threads. For example, the BLAS library may start as many threads as there are
-cores on a machine.
-
-The [`@threadcall`](@ref) macro addresses scenarios where we do not want a [`ccall`](@ref) to block the main Julia
-event loop. It schedules a C function for execution in a separate thread. A threadpool with a
-default size of 4 is used for this. The size of the threadpool is controlled via environment variable
-`UV_THREADPOOL_SIZE`. While waiting for a free thread, and during function execution once a thread
-is available, the requesting task (on the main Julia event loop) yields to other tasks. Note that
-`@threadcall` does not return till the execution is complete. From a user point of view, it is
-therefore a blocking call like other Julia APIs.
-
-It is very important that the called function does not call back into Julia.
-
-`@threadcall` may be removed/changed in future versions of Julia.
-
 # Multi-Threading (Experimental)
 
-In addition to tasks, remote calls, and remote references, Julia forwards natively
-supports multi-threading. Note that this section is experimental and the interfaces may change
-in the future.
+In addition to tasks Julia forwards natively supports multi-threading.
+Note that this section is experimental and the interfaces may change in the future.
 
 ## Setup
 
@@ -377,6 +304,8 @@ julia> a
 
 Note that [`Threads.@threads`](@ref) does not have an optional reduction parameter like [`@distributed`](@ref).
 
+## Atomic Operations
+
 Julia supports accessing and modifying values *atomically*, that is, in a thread-safe way to avoid
 [race conditions](https://en.wikipedia.org/wiki/Race_condition). A value (which must be of a primitive
 type) can be wrapped as [`Threads.Atomic`](@ref) to indicate it must be accessed in this way.
@@ -445,6 +374,8 @@ julia> acc[]
     are `Int8`, `Int16`, `Int32`, `Int64`, `Int128`, `UInt8`, `UInt16`, `UInt32`,
     `UInt64`, `UInt128`, `Float16`, `Float32`, and `Float64`. Additionally,
     `Int128` and `UInt128` are not supported on AAarch32 and ppc64le.
+    
+## Side effects and mutable function arguments
 
 When using multi-threading we have to be careful when using functions that are not
 [pure](https://en.wikipedia.org/wiki/Pure_function) as we might get a wrong answer.
@@ -535,6 +466,35 @@ julia> g_fix(r)
 
 We pass `r` vector to `g_fix` as generating several RGNs is an expensive
 operation so we do not want to repeat it every time we run the function.
+
+## @threadcall (Experimental)
+
+All I/O tasks, timers, REPL commands, etc are multiplexed onto a single OS thread via an event
+loop. A patched version of libuv ([http://docs.libuv.org/en/v1.x/](http://docs.libuv.org/en/v1.x/))
+provides this functionality. Yield points provide for co-operatively scheduling multiple tasks
+onto the same OS thread. I/O tasks and timers yield implicitly while waiting for the event to
+occur. Calling [`yield`](@ref) explicitly allows for other tasks to be scheduled.
+
+Thus, a task executing a [`ccall`](@ref) effectively prevents the Julia scheduler from executing any other
+tasks till the call returns. This is true for all calls into external libraries. Exceptions are
+calls into custom C code that call back into Julia (which may then yield) or C code that calls
+`jl_yield()` (C equivalent of [`yield`](@ref)).
+
+Note that while Julia code runs on a single thread (by default), libraries used by Julia may launch
+their own internal threads. For example, the BLAS library may start as many threads as there are
+cores on a machine.
+
+The [`@threadcall`](@ref) macro addresses scenarios where we do not want a [`ccall`](@ref) to block the main Julia
+event loop. It schedules a C function for execution in a separate thread. A threadpool with a
+default size of 4 is used for this. The size of the threadpool is controlled via environment variable
+`UV_THREADPOOL_SIZE`. While waiting for a free thread, and during function execution once a thread
+is available, the requesting task (on the main Julia event loop) yields to other tasks. Note that
+`@threadcall` does not return till the execution is complete. From a user point of view, it is
+therefore a blocking call like other Julia APIs.
+
+It is very important that the called function does not call back into Julia.
+
+`@threadcall` may be removed/changed in future versions of Julia.
 
 # Multi-Core or Distributed Processing
 
@@ -650,6 +610,24 @@ It is possible to define your own such constructs.)
 An important thing to remember is that, once fetched, a [`Future`](@ref) will cache its value
 locally. Further [`fetch`](@ref) calls do not entail a network hop. Once all referencing [`Future`](@ref)s
 have fetched, the remote stored value is deleted.
+
+[`@async`](@ref) is similar to [`@spawn`](@ref), but only runs tasks on the local process. We
+use it to create a "feeder" task for each process. Each task picks the next index that needs to
+be computed, then waits for its process to finish, then repeats until we run out of indices. Note
+that the feeder tasks do not begin to execute until the main task reaches the end of the [`@sync`](@ref)
+block, at which point it surrenders control and waits for all the local tasks to complete before
+returning from the function.
+As for v0.7 and beyond, the feeder tasks are able to share state via `nextidx` because
+they all run on the same process. 
+Even if `Tasks` are scheduled cooperatively, locking may still be required in some contexts, as in [asynchronous I\O](https://docs.julialang.org/en/stable/manual/faq/#Asynchronous-IO-and-concurrent-synchronous-writes-1)
+This means context switches only occur at well-defined points: in this case,
+when [`remotecall_fetch`](@ref) is called. This is the current state of implementation (dev v0.7) and it may change
+for future Julia versions, as it is intended to make it possible to run up to N `Tasks` on M `Process`, aka
+[M:N Threading](https://en.wikipedia.org/wiki/Thread_(computing)#Models). Then a lock acquiring\releasing 
+model for `nextidx` will be needed, as it is not safe to let multiple processes read-write a resource at
+the same time.
+
+
 
 ## Code Availability and Loading Packages
 
@@ -1646,11 +1624,11 @@ For example [MPI.jl](https://github.com/JuliaParallel/MPI.jl) is a Julia wrapper
 [DistributedArrays.jl](https://github.com/JuliaParallel/Distributedarrays.jl), as presented in [Shared Arrays](@ref).
 A mention must be done to the Julia's GPU programming ecosystem, which includes :
 
-1. Low-level (C kernel) based operations [OpenCL.jl](https://github.com/JuliaGPU/OpenCL.jl) and [CUDAdrv.jl](https://github.com/JuliaGPU/CUDAdrv.jl) which are respectively a  OpenCL interface and a CUDA wrapper.
+1. Low-level (C kernel) based operations [OpenCL.jl](https://github.com/JuliaGPU/OpenCL.jl) and [CUDAdrv.jl](https://github.com/JuliaGPU/CUDAdrv.jl) which are respectively an OpenCL interface and a CUDA wrapper.
 
-2. High level (Julia Kernel) interfaces like [CUDAnative.jl](https://github.com/JuliaGPU/CUDAnative.jl) which is a Julia native CUDA implementation.
+2. Low-level (Julia Kernel) interfaces like [CUDAnative.jl](https://github.com/JuliaGPU/CUDAnative.jl) which is a Julia native CUDA implementation.
 
-3. High-level vendor specific abstractions [CuArray.jl](https://github.com/JuliaGPU/CuArrays.jl) and [CLArray.jl](https://github.com/JuliaGPU/CLArrays.jl)
+3. High-level vendor specific abstractions like [CuArrays.jl](https://github.com/JuliaGPU/CuArrays.jl) and [CLArrays.jl](https://github.com/JuliaGPU/CLArrays.jl)
 
 4. High-level libraries like [ArrayFire.jl](https://github.com/JuliaComputing/ArrayFire.jl) and [GPUArrays.jl](https://github.com/JuliaGPU/GPUArrays.jl)
 
@@ -1706,7 +1684,7 @@ true
 julia> typeof(cuC)
 CuArray{Float64,1}
 ```
-Keep in mind that some Julia features are not currently supported by CUDAnative.jl [^2] , especially some functions like `sin` will need to be replaced with `CUDAnative.sin`.
+Keep in mind that some Julia features are not currently supported by CUDAnative.jl [^2] , especially some functions like `sin` will need to be replaced with `CUDAnative.sin`(cc: @maleadt).
 
 In the following example we will use both `DistributedArrays.jl` and `CuArrays.jl` to distribute an array across multiple
 processes and call a generic function on it.
@@ -1793,4 +1771,4 @@ mpirun -np 4 ./julia example.jl
     patterns. for additional information on the latest mpi standard, see [http://mpi-forum.org/docs](http://mpi-forum.org/docs/).
  
  [^2]:
-    [Julia GPU man pages](http://juliagpu.github.io/CUDAnative.jl/stable/man/usage.html#Julia-support-1) cc: @maleadt
+    [Julia GPU man pages](http://juliagpu.github.io/CUDAnative.jl/stable/man/usage.html#Julia-support-1)
