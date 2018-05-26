@@ -181,8 +181,32 @@ PerfJITEventListener::PerfJITEventListener() : Pid(::getpid()) {
             openFileForWrite(FilenameBuf.str(), DumpFd, sys::fs::F_RW, 0666)) {
       errs() << "could not open JIT dump file " << FilenameBuf.str() << ": "
              << EC.message() << "\n";
+
+
       return;
     }
+
+    Dumpstream = make_unique<raw_fd_ostream>(DumpFd, true);
+
+    LLVMPerfJitHeader Header = {0};
+    if (!FillMachine(Header))
+      return;
+
+    // signal this process emits JIT information
+    if (!OpenMarker())
+      return;
+
+    // emit dumpstream header
+    Header.Magic = LLVM_PERF_JIT_MAGIC;
+    Header.Version = LLVM_PERF_JIT_VERSION;
+    Header.TotalSize = sizeof(Header);
+    Header.Pid = Pid;
+    Header.Timestamp = perf_get_timestamp();
+    Dumpstream->write(reinterpret_cast<const char *>(&Header), sizeof(Header));
+
+    // Everything initialized, can do profiling now.
+    if (!Dumpstream->has_error())
+      SuccessfullyInitialized = true;
 }
 
 void PerfJITEventListener::NotifyObjectEmitted(const ObjectFile &Obj, const RuntimeDyld::LoadedObjectInfo &L) {
