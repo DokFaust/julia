@@ -3,6 +3,7 @@
 ## RandomDevice
 
 # SamplerUnion(Union{X,Y,...}) == Union{SamplerType{X},SamplerType{Y},...}
+
 SamplerUnion(U::Union) = Union{map(T->SamplerType{T}, Base.uniontypes(U))...}
 const SamplerBoolBitInteger = SamplerUnion(Union{Bool, BitInteger})
 
@@ -175,11 +176,42 @@ end
 
 #### floats
 
-mt_avail(r::MersenneTwister) = MT_CACHE_F - r.idxF
-mt_empty(r::MersenneTwister) = r.idxF == MT_CACHE_F
 mt_setfull!(r::MersenneTwister) = r.idxF = 0
-mt_setempty!(r::MersenneTwister) = r.idxF = MT_CACHE_F
-mt_pop!(r::MersenneTwister) = @inbounds return r.vals[r.idxF+=1]
+
+const ThreadBuffer = Ref{Int64}()
+
+function mt_avail(r::MersenneTwister)
+    if(Threads.nthreads() > 1)
+        return (ThreadBuffer[] - r.idxF)
+    else
+        return (MT_CACHE_F - r.idxF)
+    end
+end
+
+function mt_empty(r::MersenneTwister)
+    if(Threads.nthreads() > 1)
+        (r.idxF + 1) >= ThreadBuffer[]
+    else
+        r.idxF == MT_CACHE_F
+    end
+end
+
+function mt_setempty!(r::MersenneTwister)
+    if(Threads.nthreads() > 1)
+        r.idxF = ThreadBuffer[]
+    else
+        r.idxF = MT_CACHE_F
+    end
+end
+
+function mt_pop!(r::MersenneTwister)
+    if(Threads.nthreads() > 1)
+        i = (r.idxF+=1)*Threads.threadid()
+        @inbounds return r.vals[i]
+    else
+        @inbounds return r.vals[r.idxF+=1]
+    end
+end
 
 function gen_rand(r::MersenneTwister)
     GC.@preserve r dsfmt_fill_array_close1_open2!(r.state, pointer(r.vals), length(r.vals))

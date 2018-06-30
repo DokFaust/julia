@@ -248,6 +248,8 @@ function __init__()
         Base.showerror_nostdio(ex,
             "WARNING: Error during initialization of module Random")
     end
+
+    const ThreadBuffer[] = div(MT_CACHE_F, Threads.nthreads())
 end
 
 include("RNGs.jl")
