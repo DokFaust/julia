@@ -155,6 +155,31 @@ extern void _chkstk(void);
 //    return alloca(40960);
 //}
 #endif
+ // TODO mille controlli
+JL_DLLEXPORT void __jl_probe_stack(void)
+{
+#if defined(_CPU_X86_64_)
+    asm volatile (" mov %rax, %r11;\n"
+                  " cmp $0x1000, %r11;\n"
+                  " jna 3f;\n"
+                  " 2:\n"
+                  " sub $0x1000, %rsp;\n"
+                  " test %rsp, 8(%rsp);\n"
+                  " sub $0x1000, %r11;\n"
+                  " cmp $0x1000, %r11;\n"
+                  " ja 2b;\n"
+                  " 3:\n"
+                  " sub %r11, %rsp;\n"
+                  " test %rsp, 8(%rsp);\n"
+                  " add %rax, %rsp;\n"
+                  " ret;"
+                  );
+    fprintf(stderr, "You shoudn't get here\n");
+    // gc_debug_critical_error();
+    // abort(); //you shouldn't get here!
+#endif
+}
+
 }
 
 #if defined(_COMPILER_MICROSOFT_) && !defined(__alignof__)
@@ -5475,6 +5500,17 @@ static std::unique_ptr<Module> emit_function(
 #ifdef JL_DEBUG_BUILD
     f->addFnAttr(Attribute::StackProtectStrong);
 #endif
+
+#if !defined(JL_ASAN_ENABLED)
+#if !defined(_OS_WINDOWS_) && (defined(_CPU_X86_64_) || defined(_CPU_X86_))
+    f->addFnAttr("probe-stack", "__jl_probe_stack");
+
+    Function *jl_probe_stack = Function::Create(FunctionType::get(T_void, false),
+            Function::ExternalLinkage, "__jl_probe_stack", M);
+    add_named_global(jl_probe_stack, __jl_probe_stack);
+#endif // !_OS_WINDOWS_ && (_CPU_X86_64_ || _CPU_X86_)
+#endif //! JL_ASAN_ENABLED
+
     ctx.f = f;
 
     // Step 4b. determine debug info signature and other type info for locals
@@ -6850,6 +6886,9 @@ static void init_julia_llvm_env(Module *m)
                          "__stack_chk_fail", m);
     jl__stack_chk_fail->setDoesNotReturn();
     add_named_global(jl__stack_chk_fail, &__stack_chk_fail);
+
+    //global_to_llvm("jl_probe_stack", (void*)&__jl_probe_stack, m);
+
 
     global_jlvalue_to_llvm("jl_true", &jl_true, m);
     global_jlvalue_to_llvm("jl_false", &jl_false, m);
